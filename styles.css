@@ -20,3 +20,11 @@
   .stem-row{grid-template-columns:1fr auto}
   .stem-volume-wrap{grid-column:1 / -1}
 }
+
+.render-options{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:10px;margin-top:14px}
+.option-card{align-items:flex-start;white-space:normal;border:1px solid var(--border);border-radius:14px;background:#12141d;padding:12px}
+.option-card input{flex:0 0 auto;margin-top:2px}
+.option-card span{margin:0;color:var(--ink);font-size:.9rem}
+.option-card strong{display:block}
+.option-card small{display:block;color:var(--muted);font-size:.78rem;line-height:1.35;margin-top:3px}
+@media(max-width:720px){.render-options{grid-template-columns:1fr}}
