@@ -335,7 +335,21 @@ async function renderStem(seq, trackNo, sampleRate, requestedLoops) {
 
   let loopsSeen = 0;
   let loopDetected = false;
-  let prevPointer = renderer.tracks[0]?.pointer ?? 0;
+
+  // Hook the conductor track's Jump command so loop counting is based on the
+  // sequence's actual backwards control-flow jump, not elapsed seconds.
+  const conductor = renderer.tracks[0];
+  if (conductor?.handlers?.[0x94]) {
+    const originalJump = conductor.handlers[0x94];
+    conductor.handlers[0x94] = function (cmd) {
+      if (cmd.offset < this.pointer) {
+        loopsSeen++;
+        loopDetected = true;
+      }
+      return originalJump.call(this, cmd);
+    };
+  }
+
   const maxSeconds = 20 * 60;
   const maxTicks = Math.ceil(maxSeconds * 1000 / Audio.SequenceRenderer.TICK_INTERVAL_MS);
   let ticks = 0;
@@ -343,30 +357,7 @@ async function renderStem(seq, trackNo, sampleRate, requestedLoops) {
   while (ticks++ < maxTicks) {
     renderer.tick();
 
-    const t0 = renderer.tracks[0];
-    if (t0) {
-      const pointer = t0.pointer;
-      if (pointer < prevPointer) {
-        // Black/White's BGM loops are normally implemented as a backwards
-        // control-flow jump on the conductor track. Calls/returns can also move
-        // the pointer backwards, so only count a repeated destination as the
-        // song loop after seeing it consistently.
-        const key = pointer;
-        renderer.__loopTargets ??= new Map();
-        const count = (renderer.__loopTargets.get(key) || 0) + 1;
-        renderer.__loopTargets.set(key, count);
-
-        // First arrival completes the first pass through that loop. If this
-        // destination repeats, it is definitely recurring control flow.
-        if (count >= 1) {
-          loopsSeen++;
-          loopDetected = true;
-          if (loopsSeen >= requestedLoops) break;
-        }
-      }
-      prevPointer = pointer;
-    }
-
+    if (loopDetected && loopsSeen >= requestedLoops) break;
     if (allTracksFinished(renderer)) break;
 
     if ((ticks & 0x1fff) === 0) {
@@ -374,12 +365,15 @@ async function renderStem(seq, trackNo, sampleRate, requestedLoops) {
     }
   }
 
+  // Preserve the renderer's final not-yet-full sink buffer too, otherwise
+  // every stem can lose up to one 4096-frame chunk at its exact end point.
+  if (renderer.synth?.pos > 0) {
+    leftChunks.push(renderer.synth.buffer[0].slice(0, renderer.synth.pos));
+    rightChunks.push(renderer.synth.buffer[1].slice(0, renderer.synth.pos));
+  }
+
   const left = mergeFloatChunks(leftChunks);
   const right = mergeFloatChunks(rightChunks);
-
-  // The renderer emits fixed-size chunks. Keep them as-is; every stem of the
-  // same sequence follows the same conductor and therefore lands on the same
-  // musical boundary.
   return { left, right, loopDetected };
 }
 
