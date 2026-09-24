@@ -138,14 +138,11 @@ function findNitroFile(rom, wantedName) {
 }
 
 function listMusic(sdat) {
+  // Keep the sequence order exactly as it appears in the game's SDAT.
+  // Seasonal/version variants are already adjacent there, so do not alphabetize.
   return sdat.fs.sequences
     .filter((s) => s.name && (s.name.startsWith("SEQ_BGM_") || s.name.startsWith("SEQ_ME_")))
-    .map(classifySequence)
-    .sort((a, b) => {
-      const aa = a.baseUse.localeCompare(b.baseUse);
-      if (aa) return aa;
-      return a.variant.localeCompare(b.variant);
-    });
+    .map(classifySequence);
 }
 
 function visibleSequences() {
