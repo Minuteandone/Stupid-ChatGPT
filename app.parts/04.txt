@@ -1,0 +1,153 @@
+  a.download = filename;
+  document.body.appendChild(a);
+  a.click();
+  a.remove();
+  setTimeout(() => URL.revokeObjectURL(url), 30000);
+}
+
+function songInfoText(song, options, stemCount, loopSignature, warnings) {
+  const lines = [
+    `Used for: ${song.groupLabel}`,
+    song.variant ? `Variation: ${song.variant}` : null,
+    `Internal sequence name: ${song.name}`,
+    `SDAT sequence ID: ${song.id}`,
+    `Bank ID: ${song.fileInfo?.bankId ?? "unknown"}`,
+    `Source ROM: ${state.gameTitle || state.romName}${state.gameCode ? ` (${state.gameCode})` : ""}`,
+    `Sample rate: ${options.sampleRate} Hz`,
+    loopSignature ? `Loops rendered: ${options.loops} (intro once, then ${options.loops} complete loop pass${options.loops === 1 ? "" : "es"})` : "Looping: no backward SSEQ loop jump detected; rendered to natural end",
+    `Exported stems: ${stemCount}`,
+    "",
+    "Each WAV is one active Nintendo DS SSEQ sequencer track. Silent tracks are omitted.",
+    "The site processes the ROM locally in your browser; the ROM is not uploaded.",
+  ].filter(Boolean);
+  if (warnings.length) lines.push("", "Warnings:", ...warnings.map((w) => `- ${w}`));
+  return lines.join("\n");
+}
+
+async function addSongToZip(zip, song, options, progressState) {
+  const seq = state.sdat.fs.sequences.find((s) => s.id === song.id);
+  if (!seq) throw new Error(`Sequence ${song.id} disappeared from the SDAT index.`);
+  const fileInfo = Audio.SequenceRenderer.makeInfoSSEQ(state.sdat, song.id);
+  const loopSignature = await detectLoopSignature(fileInfo, options.sampleRate, song.id);
+
+  let folder = zip.folder(sanitizeName(song.groupLabel));
+  if (song.variant) folder = folder.folder(sanitizeName(song.variant));
+
+  const warnings = [];
+  let stemCount = 0;
+  for (let track = 0; track < 16; track++) {
+    progressState.done++;
+    updateProgress(progressState.done, progressState.total, `${song.groupLabel}${song.variant ? ` — ${song.variant}` : ""}: track ${track + 1}/16`);
+    const rendered = await renderStem(fileInfo, track, options.loops, options.sampleRate, loopSignature);
+    if (rendered) {
+      stemCount++;
+      folder.file(`Stem ${String(track + 1).padStart(2, "0")}.wav`, rendered.wav);
+      if (rendered.emergencyCut) warnings.push(`Stem ${track + 1} hit the ${MAX_RENDER_SECONDS}-second emergency render limit.`);
+    }
+    await yieldToBrowser();
+  }
+
+  if (!loopSignature) warnings.push("No backward SSEQ jump was detected, so loop count could not be applied to this sequence.");
+  if (stemCount === 0) warnings.push("No audible sequencer tracks were rendered. The sequence may use commands not supported by the browser renderer.");
+  folder.file("info.txt", songInfoText(song, options, stemCount, loopSignature, [...new Set(warnings)]));
+}
+
+async function exportSongs(songs) {
+  if (!songs.length || state.busy) return;
+  const options = {
+    loops: Math.max(1, Number(loopCount.value) || 2),
+    sampleRate: Number(sampleRateSelect.value) || 32768,
+  };
+  const batchSize = Math.max(1, Number(batchSizeSelect.value) || 1);
+  setBusy(true);
+  hideProgress();
+
+  try {
+    for (let start = 0; start < songs.length; start += batchSize) {
+      const batch = songs.slice(start, start + batchSize);
+      const zip = new JSZip();
+      const progressState = { done: 0, total: batch.length * 16 };
+      for (const song of batch) {
+        await addSongToZip(zip, song, options, progressState);
+        state.exported.add(song.id);
+      }
+      updateProgress(progressState.total, progressState.total, "Building ZIP…");
+      const blob = await zip.generateAsync({ type: "blob", compression: "STORE", streamFiles: true });
+      const first = sanitizeName(batch[0].groupLabel).slice(0, 55);
+      const suffix = batch.length > 1 ? ` + ${batch.length - 1} more` : "";
+      downloadBlob(blob, `${first}${suffix} - stems.zip`);
+      await yieldToBrowser();
+    }
+    setStatus(`Finished exporting ${songs.length} selection${songs.length === 1 ? "" : "s"}.`, "ok");
+  } catch (error) {
+    console.error(error);
+    setStatus(`Export failed: ${error?.message || error}`, "error");
+  } finally {
+    hideProgress();
+    setBusy(false);
+  }
+}
+
+romInput.addEventListener("change", async () => {
+  const file = romInput.files?.[0];
+  if (!file) return;
+  controls.classList.add("hidden");
+  catalogSection.classList.add("hidden");
+  state.sdat = null;
+  state.songs = [];
+  state.selected.clear();
+  state.exported.clear();
+  state.loopCache.clear();
+  setStatus(`Reading ${file.name} locally…`);
+
+  try {
+    const rom = await file.arrayBuffer();
+    const bytes = new Uint8Array(rom);
+    state.romName = file.name;
+    state.gameTitle = readAscii(bytes, 0, 12);
+    state.gameCode = readAscii(bytes, 12, 4);
+
+    const sound = findNitroFile(rom);
+    setStatus(`Found ${sound.path}. Parsing sound archive…`);
+    const sdat = new Audio.SDAT(BufferReader.new(sound.buffer));
+    state.sdat = sdat;
+    state.songs = buildDescriptors(sdat.fs.sequences);
+
+    if (!state.songs.some((s) => s.kind === "bgm")) throw new Error("The SDAT parsed, but no SEQ_BGM music sequences were found.");
+
+    const bgmCount = state.songs.filter((s) => s.kind === "bgm").length;
+    const jingleCount = state.songs.filter((s) => s.kind === "jingle").length;
+    setStatus(`${state.gameTitle || "Nintendo DS ROM"}${state.gameCode ? ` (${state.gameCode})` : ""}: found ${bgmCount} music sequences and ${jingleCount} jingles in ${sound.path}.`, "ok");
+    controls.classList.remove("hidden");
+    catalogSection.classList.remove("hidden");
+    renderCatalog();
+  } catch (error) {
+    console.error(error);
+    setStatus(`Could not load this ROM: ${error?.message || error}`, "error");
+  }
+});
+
+includeJingles.addEventListener("change", renderCatalog);
+searchInput.addEventListener("input", renderCatalog);
+
+selectVisible.addEventListener("click", () => {
+  for (const song of visibleSongs()) state.selected.add(song.id);
+  renderCatalog();
+});
+
+clearSelection.addEventListener("click", () => {
+  state.selected.clear();
+  renderCatalog();
+});
+
+exportSelected.addEventListener("click", () => {
+  const songs = state.songs.filter((s) => state.selected.has(s.id));
+  exportSongs(songs);
+});
+
+exportNext.addEventListener("click", () => {
+  const size = Math.max(1, Number(batchSizeSelect.value) || 1);
+  let candidates = state.songs.filter((s) => state.selected.has(s.id) && !state.exported.has(s.id));
+  if (!candidates.length) candidates = visibleSongs().filter((s) => !state.exported.has(s.id));
+  exportSongs(candidates.slice(0, size));
+});
