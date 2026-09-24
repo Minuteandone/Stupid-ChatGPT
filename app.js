@@ -1,5 +1,4 @@
 import { Audio, BufferReader } from "https://esm.sh/nitro-fs@1.1.1?bundle";
-import JSZip from "https://esm.sh/jszip@3.10.1?bundle";
 import { SONG_USAGE } from "./catalog.js";
 
 const $ = (id) => document.getElementById(id);
@@ -280,6 +279,144 @@ function interleaveToWav(left, right, sampleRate) {
   return out;
 }
 
+
+const ZIP_UTF8_FLAG = 0x0800;
+const ZIP_STORE_METHOD = 0;
+const ZIP_VERSION = 20;
+
+const CRC32_TABLE = (() => {
+  const table = new Uint32Array(256);
+  for (let n = 0; n < 256; n++) {
+    let c = n;
+    for (let k = 0; k < 8; k++) {
+      c = (c & 1) ? (0xedb88320 ^ (c >>> 1)) : (c >>> 1);
+    }
+    table[n] = c >>> 0;
+  }
+  return table;
+})();
+
+function crc32(data) {
+  const bytes = data instanceof Uint8Array
+    ? data
+    : data instanceof ArrayBuffer
+      ? new Uint8Array(data)
+      : new Uint8Array(data.buffer, data.byteOffset, data.byteLength);
+
+  let crc = 0xffffffff;
+  for (let i = 0; i < bytes.length; i++) {
+    crc = CRC32_TABLE[(crc ^ bytes[i]) & 0xff] ^ (crc >>> 8);
+  }
+  return (crc ^ 0xffffffff) >>> 0;
+}
+
+function zipDosDateTime(date = new Date()) {
+  const year = Math.max(1980, date.getFullYear());
+  const time =
+    (date.getHours() << 11) |
+    (date.getMinutes() << 5) |
+    Math.floor(date.getSeconds() / 2);
+  const day =
+    ((year - 1980) << 9) |
+    ((date.getMonth() + 1) << 5) |
+    date.getDate();
+  return { time, day };
+}
+
+function makeZipEntry(name, data) {
+  const nameBytes = new TextEncoder().encode(name);
+  const bytes = data instanceof Uint8Array
+    ? data
+    : data instanceof ArrayBuffer
+      ? new Uint8Array(data)
+      : new TextEncoder().encode(String(data));
+
+  return {
+    name,
+    nameBytes,
+    bytes,
+    size: bytes.byteLength,
+    crc: crc32(bytes)
+  };
+}
+
+async function buildStoreZip(entries, onProgress) {
+  const now = zipDosDateTime();
+  const parts = [];
+  const centralParts = [];
+  let offset = 0;
+  let totalDataBytes = 0;
+
+  for (const entry of entries) totalDataBytes += entry.size;
+  if (totalDataBytes > 0xffffffff - (entries.length * 256)) {
+    throw new Error("This ZIP would exceed the classic ZIP size limit. Export fewer songs at once.");
+  }
+
+  for (let i = 0; i < entries.length; i++) {
+    const entry = entries[i];
+
+    const local = new ArrayBuffer(30);
+    const lv = new DataView(local);
+    lv.setUint32(0, 0x04034b50, true);
+    lv.setUint16(4, ZIP_VERSION, true);
+    lv.setUint16(6, ZIP_UTF8_FLAG, true);
+    lv.setUint16(8, ZIP_STORE_METHOD, true);
+    lv.setUint16(10, now.time, true);
+    lv.setUint16(12, now.day, true);
+    lv.setUint32(14, entry.crc, true);
+    lv.setUint32(18, entry.size, true);
+    lv.setUint32(22, entry.size, true);
+    lv.setUint16(26, entry.nameBytes.length, true);
+    lv.setUint16(28, 0, true);
+
+    parts.push(local, entry.nameBytes, entry.bytes);
+
+    const central = new ArrayBuffer(46);
+    const cv = new DataView(central);
+    cv.setUint32(0, 0x02014b50, true);
+    cv.setUint16(4, ZIP_VERSION, true);
+    cv.setUint16(6, ZIP_VERSION, true);
+    cv.setUint16(8, ZIP_UTF8_FLAG, true);
+    cv.setUint16(10, ZIP_STORE_METHOD, true);
+    cv.setUint16(12, now.time, true);
+    cv.setUint16(14, now.day, true);
+    cv.setUint32(16, entry.crc, true);
+    cv.setUint32(20, entry.size, true);
+    cv.setUint32(24, entry.size, true);
+    cv.setUint16(28, entry.nameBytes.length, true);
+    cv.setUint16(30, 0, true);
+    cv.setUint16(32, 0, true);
+    cv.setUint16(34, 0, true);
+    cv.setUint16(36, 0, true);
+    cv.setUint32(38, 0, true);
+    cv.setUint32(42, offset, true);
+    centralParts.push(central, entry.nameBytes);
+
+    offset += 30 + entry.nameBytes.length + entry.size;
+
+    if (onProgress) onProgress((i + 1) / entries.length, entry.name);
+    if ((i & 3) === 3) await new Promise((resolve) => setTimeout(resolve, 0));
+  }
+
+  let centralSize = 0;
+  for (const part of centralParts) {
+    centralSize += part.byteLength;
+  }
+
+  const eocd = new ArrayBuffer(22);
+  const ev = new DataView(eocd);
+  ev.setUint32(0, 0x06054b50, true);
+  ev.setUint16(4, 0, true);
+  ev.setUint16(6, 0, true);
+  ev.setUint16(8, entries.length, true);
+  ev.setUint16(10, entries.length, true);
+  ev.setUint32(12, centralSize, true);
+  ev.setUint32(16, offset, true);
+  ev.setUint16(20, 0, true);
+
+  return new Blob([...parts, ...centralParts, eocd], { type: "application/zip" });
+}
+
 function audioPeak(left, right) {
   let peak = 0;
   const step = Math.max(1, Math.floor(left.length / 250000));
@@ -384,7 +521,7 @@ async function exportSongs(songs) {
   setBusy(true);
   const sampleRate = Number($("sampleRate").value);
   const loops = Number($("loopCount").value);
-  const zip = new JSZip();
+  const zipEntries = [];
 
   try {
     let completedUnits = 0;
@@ -393,7 +530,6 @@ async function exportSongs(songs) {
     for (let songIndex = 0; songIndex < songs.length; songIndex++) {
       const s = songs[songIndex];
       const folderPath = sequenceFolder(s);
-      const folder = zip.folder(folderPath);
       const renderedTracks = [];
       let anyLoopDetected = false;
 
@@ -408,7 +544,10 @@ async function exportSongs(songs) {
 
         if (audioPeak(rendered.left, rendered.right) > 0.00002) {
           const wav = interleaveToWav(rendered.left, rendered.right, sampleRate);
-          folder.file(`Track ${String(track + 1).padStart(2, "0")}.wav`, wav);
+          zipEntries.push(makeZipEntry(
+            `${folderPath}/Track ${String(track + 1).padStart(2, "0")}.wav`,
+            wav
+          ));
           renderedTracks.push(track);
         }
 
@@ -416,24 +555,17 @@ async function exportSongs(songs) {
         await new Promise((resolve) => setTimeout(resolve, 0));
       }
 
-      folder.file("info.txt", infoText(s, sampleRate, loops, renderedTracks, anyLoopDetected));
+      zipEntries.push(makeZipEntry(
+        `${folderPath}/info.txt`,
+        infoText(s, sampleRate, loops, renderedTracks, anyLoopDetected)
+      ));
     }
 
-    setProgress(0.985, "Packing one ZIP…");
-    // PCM WAV stems are already enormous and don't benefit enough from
-    // CPU-heavy DEFLATE to justify the wait on iPad/Safari.
-    // STORE makes the ZIP larger but turns this step into mostly file assembly.
-    const blob = await zip.generateAsync(
-      {
-        type: "blob",
-        compression: "STORE",
-        streamFiles: true
-      },
-      (meta) => {
-        const pct = 0.985 + (meta.percent / 100) * 0.015;
-        setProgress(pct, "Packing one ZIP (fast / no compression)…");
-      }
-    );
+    setProgress(0.985, "Building fast ZIP…");
+    const blob = await buildStoreZip(zipEntries, (fraction, name) => {
+      const pct = 0.985 + fraction * 0.015;
+      setProgress(pct, `Building fast ZIP… ${name}`);
+    });
 
     const a = document.createElement("a");
     a.href = URL.createObjectURL(blob);
