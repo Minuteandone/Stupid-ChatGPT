@@ -63,6 +63,33 @@
       </div>
     </section>
 
+    <section id="mixerSection" class="card hidden">
+      <div class="mixer-head">
+        <div>
+          <div class="eyebrow">stem mixer</div>
+          <h2 id="mixerTitle">Stem mixer</h2>
+          <p id="mixerStatus" class="status">Choose a song and tap Mix.</p>
+        </div>
+        <button id="closeMixer" class="secondary">Close mixer</button>
+      </div>
+
+      <div id="mixerTransport" class="mixer-transport hidden">
+        <div class="transport-buttons">
+          <button id="mixerPlay">Play</button>
+          <button id="mixerStop" class="secondary">Stop</button>
+          <button id="mixerMuteAll" class="secondary">Mute all</button>
+          <button id="mixerUnmuteAll" class="secondary">Unmute all</button>
+        </div>
+        <div class="seek-row">
+          <span id="mixerCurrent">0:00</span>
+          <input id="mixerSeek" type="range" min="0" max="1" step="0.01" value="0" aria-label="Mixer position" />
+          <span id="mixerDuration">0:00</span>
+        </div>
+      </div>
+
+      <div id="mixerStems" class="mixer-stems"></div>
+    </section>
+
     <section id="catalogSection" class="card hidden">
       <div class="catalog-head">
         <div>
