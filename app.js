@@ -8,7 +8,18 @@ const state = {
   sequences: [],
   selected: new Set(),
   fileName: "",
-  busy: false
+  busy: false,
+  mixer: {
+    ctx: null,
+    song: null,
+    stems: [],
+    sources: [],
+    duration: 0,
+    offset: 0,
+    startedAt: 0,
+    playing: false,
+    raf: 0
+  }
 };
 
 const VARIANT_RE = /\s*\((Spring|Summer|Autumn|Winter|Autumn\/Winter\/Spring|Pokémon Black|Pokémon White)\)\s*$/i;
@@ -166,11 +177,12 @@ function renderCatalog() {
   $("catalog").replaceChildren();
 
   for (const s of items) {
-    const row = document.createElement("label");
+    const row = document.createElement("div");
     row.className = "song";
 
     const box = document.createElement("input");
     box.type = "checkbox";
+    box.setAttribute("aria-label", `Select ${s.baseUse} for export`);
     box.checked = state.selected.has(s.id);
     box.addEventListener("change", () => {
       if (box.checked) state.selected.add(s.id);
@@ -187,14 +199,25 @@ function renderCatalog() {
     meta.textContent = s.isJingle ? "Short fanfare / jingle" : "Background music";
     text.append(name, meta);
 
-    row.append(box, text);
+    const actions = document.createElement("div");
+    actions.className = "song-actions";
+
     if (s.variant) {
       const badge = document.createElement("div");
       badge.className = "variant";
       badge.textContent = s.variant;
-      row.append(badge);
+      actions.append(badge);
     }
 
+    const mix = document.createElement("button");
+    mix.type = "button";
+    mix.className = "mix-button";
+    mix.textContent = "Mix";
+    mix.disabled = state.busy;
+    mix.addEventListener("click", () => openMixer(s));
+    actions.append(mix);
+
+    row.append(box, text, actions);
     $("catalog").append(row);
   }
 }
@@ -218,6 +241,9 @@ function setBusy(busy) {
   for (const id of ["exportSelected", "selectVisible", "clearSelection", "romInput"]) {
     $(id).disabled = busy;
   }
+  document.querySelectorAll(".mix-button").forEach((button) => {
+    button.disabled = busy;
+  });
 }
 
 function allTracksFinished(renderer) {
@@ -515,6 +541,242 @@ async function renderStem(seq, trackNo, sampleRate, requestedLoops) {
   return { left, right, loopDetected };
 }
 
+
+function formatTime(seconds) {
+  const safe = Number.isFinite(seconds) ? Math.max(0, seconds) : 0;
+  const mins = Math.floor(safe / 60);
+  const secs = Math.floor(safe % 60);
+  return `${mins}:${String(secs).padStart(2, "0")}`;
+}
+
+function stopMixerSources() {
+  for (const source of state.mixer.sources) {
+    try { source.stop(); } catch {}
+  }
+  state.mixer.sources = [];
+}
+
+function currentMixerPosition() {
+  if (!state.mixer.playing || !state.mixer.ctx) return state.mixer.offset;
+  return Math.max(0, Math.min(
+    state.mixer.duration,
+    state.mixer.ctx.currentTime - state.mixer.startedAt
+  ));
+}
+
+function updateMixerSeek(position = currentMixerPosition()) {
+  const pos = Math.max(0, Math.min(state.mixer.duration || 0, position || 0));
+  $("mixerSeek").max = String(Math.max(0.01, state.mixer.duration || 0.01));
+  $("mixerSeek").value = String(pos);
+  $("mixerCurrent").textContent = formatTime(pos);
+  $("mixerDuration").textContent = formatTime(state.mixer.duration);
+}
+
+function updateMixerClock() {
+  cancelAnimationFrame(state.mixer.raf);
+  if (!state.mixer.playing) return;
+
+  const pos = currentMixerPosition();
+  updateMixerSeek(pos);
+
+  if (pos >= state.mixer.duration - 0.01) {
+    stopMixer(false);
+    return;
+  }
+
+  state.mixer.raf = requestAnimationFrame(updateMixerClock);
+}
+
+function applyStemGain(stem) {
+  if (!stem.gain) return;
+  stem.gain.gain.value = stem.muted ? 0 : stem.volume;
+}
+
+function renderMixerStems() {
+  $("mixerStems").replaceChildren();
+
+  for (const stem of state.mixer.stems) {
+    const row = document.createElement("div");
+    row.className = "stem-row";
+
+    const label = document.createElement("div");
+    const name = document.createElement("div");
+    name.className = "stem-name";
+    name.textContent = `Track ${String(stem.track + 1).padStart(2, "0")}`;
+    const meta = document.createElement("div");
+    meta.className = "stem-meta";
+    meta.textContent = `${formatTime(stem.buffer.duration)} · sequence track ${stem.track + 1}`;
+    label.append(name, meta);
+
+    const muteLabel = document.createElement("label");
+    muteLabel.className = "stem-mute";
+    const mute = document.createElement("input");
+    mute.type = "checkbox";
+    mute.checked = stem.muted;
+    mute.addEventListener("change", () => {
+      stem.muted = mute.checked;
+      applyStemGain(stem);
+    });
+    muteLabel.append(mute, document.createTextNode("Mute"));
+
+    const volumeWrap = document.createElement("label");
+    volumeWrap.className = "stem-volume-wrap";
+    const volumeText = document.createElement("span");
+    volumeText.textContent = "Volume";
+    const volume = document.createElement("input");
+    volume.className = "stem-volume";
+    volume.type = "range";
+    volume.min = "0";
+    volume.max = "1.5";
+    volume.step = "0.01";
+    volume.value = String(stem.volume);
+    volume.addEventListener("input", () => {
+      stem.volume = Number(volume.value);
+      applyStemGain(stem);
+    });
+    volumeWrap.append(volumeText, volume);
+
+    row.append(label, muteLabel, volumeWrap);
+    $("mixerStems").append(row);
+  }
+}
+
+async function ensureAudioContext() {
+  const AudioContextClass = window.AudioContext || window.webkitAudioContext;
+  if (!AudioContextClass) throw new Error("Web Audio is not supported in this browser.");
+  if (!state.mixer.ctx) state.mixer.ctx = new AudioContextClass();
+  if (state.mixer.ctx.state === "suspended") {
+    await state.mixer.ctx.resume();
+  }
+  return state.mixer.ctx;
+}
+
+async function playMixer() {
+  if (!state.mixer.stems.length || state.mixer.playing) return;
+  const ctx = await ensureAudioContext();
+
+  if (state.mixer.offset >= state.mixer.duration - 0.01) {
+    state.mixer.offset = 0;
+  }
+
+  stopMixerSources();
+  const startAt = ctx.currentTime + 0.035;
+  const offset = state.mixer.offset;
+
+  for (const stem of state.mixer.stems) {
+    if (offset >= stem.buffer.duration) continue;
+
+    const source = ctx.createBufferSource();
+    source.buffer = stem.buffer;
+    source.connect(stem.gain);
+    source.start(startAt, offset);
+    state.mixer.sources.push(source);
+  }
+
+  state.mixer.startedAt = startAt - offset;
+  state.mixer.playing = true;
+  $("mixerPlay").textContent = "Pause";
+  updateMixerClock();
+}
+
+function pauseMixer() {
+  if (!state.mixer.playing) return;
+  state.mixer.offset = currentMixerPosition();
+  stopMixerSources();
+  state.mixer.playing = false;
+  cancelAnimationFrame(state.mixer.raf);
+  $("mixerPlay").textContent = "Play";
+  updateMixerSeek(state.mixer.offset);
+}
+
+function stopMixer(reset = true) {
+  stopMixerSources();
+  state.mixer.playing = false;
+  cancelAnimationFrame(state.mixer.raf);
+  if (reset) state.mixer.offset = 0;
+  else state.mixer.offset = Math.min(state.mixer.duration, currentMixerPosition());
+  $("mixerPlay").textContent = "Play";
+  updateMixerSeek(state.mixer.offset);
+}
+
+function clearMixer(hide = true) {
+  stopMixer(true);
+  for (const stem of state.mixer.stems) {
+    try { stem.gain.disconnect(); } catch {}
+  }
+  state.mixer.song = null;
+  state.mixer.stems = [];
+  state.mixer.duration = 0;
+  state.mixer.offset = 0;
+  $("mixerStems").replaceChildren();
+  $("mixerTransport").classList.add("hidden");
+  if (hide) $("mixerSection").classList.add("hidden");
+}
+
+async function openMixer(song) {
+  if (!state.sdat || state.busy) return;
+
+  $("mixerSection").classList.remove("hidden");
+  $("mixerTitle").textContent = `${song.baseUse}${song.variant ? " — " + song.variant : ""}`;
+  $("mixerStatus").textContent = "Preparing Web Audio…";
+  $("mixerStems").replaceChildren();
+  $("mixerTransport").classList.add("hidden");
+  $("mixerSection").scrollIntoView({ behavior: "smooth", block: "start" });
+
+  try {
+    // Create/resume from the button gesture so Chrome on iPad allows playback later.
+    const ctx = await ensureAudioContext();
+    clearMixer(false);
+    state.mixer.song = song;
+
+    setBusy(true);
+    const sampleRate = Number($("sampleRate").value);
+    const loops = Number($("loopCount").value);
+    const stems = [];
+
+    for (let track = 0; track < 16; track++) {
+      $("mixerStatus").textContent = `Rendering stem ${track + 1}/16…`;
+      const rendered = await renderStem(song, track, sampleRate, loops);
+
+      if (audioPeak(rendered.left, rendered.right) > 0.00002) {
+        const frames = Math.min(rendered.left.length, rendered.right.length);
+        const buffer = ctx.createBuffer(2, frames, sampleRate);
+        buffer.copyToChannel(rendered.left.subarray(0, frames), 0);
+        buffer.copyToChannel(rendered.right.subarray(0, frames), 1);
+
+        const gain = ctx.createGain();
+        gain.connect(ctx.destination);
+
+        stems.push({
+          track,
+          buffer,
+          gain,
+          muted: false,
+          volume: 1
+        });
+      }
+
+      await new Promise((resolve) => setTimeout(resolve, 0));
+    }
+
+    state.mixer.stems = stems;
+    state.mixer.duration = stems.reduce((max, stem) => Math.max(max, stem.buffer.duration), 0);
+    state.mixer.offset = 0;
+
+    renderMixerStems();
+    updateMixerSeek(0);
+    $("mixerTransport").classList.remove("hidden");
+    $("mixerStatus").textContent = stems.length
+      ? `Ready · ${stems.length} audible stem${stems.length === 1 ? "" : "s"} · ${loops} loop${loops === 1 ? "" : "s"}`
+      : "No audible stems were found.";
+  } catch (err) {
+    console.error(err);
+    $("mixerStatus").textContent = `Mixer failed: ${err?.message || err}`;
+  } finally {
+    setBusy(false);
+  }
+}
+
 async function exportSongs(songs) {
   if (!songs.length) {
     alert("Select at least one song first.");
@@ -593,6 +855,7 @@ $("romInput").addEventListener("change", async (event) => {
   const file = event.target.files?.[0];
   if (!file) return;
 
+  clearMixer(true);
   state.sdat = null;
   state.sequences = [];
   state.selected.clear();
@@ -639,6 +902,49 @@ $("clearSelection").addEventListener("click", () => {
   state.selected.clear();
   renderCatalog();
 });
+
+
+$("mixerPlay").addEventListener("click", async () => {
+  if (state.mixer.playing) pauseMixer();
+  else await playMixer();
+});
+
+$("mixerStop").addEventListener("click", () => stopMixer(true));
+
+$("mixerMuteAll").addEventListener("click", () => {
+  for (const stem of state.mixer.stems) {
+    stem.muted = true;
+    applyStemGain(stem);
+  }
+  renderMixerStems();
+});
+
+$("mixerUnmuteAll").addEventListener("click", () => {
+  for (const stem of state.mixer.stems) {
+    stem.muted = false;
+    applyStemGain(stem);
+  }
+  renderMixerStems();
+});
+
+$("mixerSeek").addEventListener("input", () => {
+  const value = Math.max(0, Math.min(state.mixer.duration, Number($("mixerSeek").value) || 0));
+  if (!state.mixer.playing) {
+    state.mixer.offset = value;
+  }
+  $("mixerCurrent").textContent = formatTime(value);
+});
+
+$("mixerSeek").addEventListener("change", async () => {
+  const value = Math.max(0, Math.min(state.mixer.duration, Number($("mixerSeek").value) || 0));
+  const wasPlaying = state.mixer.playing;
+  if (wasPlaying) pauseMixer();
+  state.mixer.offset = value;
+  updateMixerSeek(value);
+  if (wasPlaying) await playMixer();
+});
+
+$("closeMixer").addEventListener("click", () => clearMixer(true));
 
 $("exportSelected").addEventListener("click", async () => {
   const songs = state.sequences.filter((s) => state.selected.has(s.id));
