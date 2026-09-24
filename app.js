@@ -239,7 +239,7 @@ function setProgress(frac, text) {
 
 function setBusy(busy) {
   state.busy = busy;
-  for (const id of ["exportSelected", "selectVisible", "clearSelection", "romInput"]) {
+  for (const id of ["exportSelected", "selectVisible", "clearSelection", "romInput", "separateInstruments", "groupDuplicateInstruments"]) {
     $(id).disabled = busy;
   }
   document.querySelectorAll(".mix-button").forEach((button) => {
@@ -465,7 +465,20 @@ function sequenceFolder(s) {
   return s.variant ? `${base}/${safeName(s.variant)}` : base;
 }
 
-function infoText(s, sampleRate, loops, renderedTracks, loopDetected) {
+function getRenderOptions() {
+  return {
+    separateInstruments: $("separateInstruments").checked,
+    groupDuplicateInstruments: $("groupDuplicateInstruments").checked
+  };
+}
+
+function stemTrackText(stem) {
+  const tracks = stem.tracks?.length ? stem.tracks : [stem.track];
+  const labels = tracks.map((track) => String(track + 1).padStart(2, "0"));
+  return labels.length === 1 ? `Track ${labels[0]}` : `Tracks ${labels.join(", ")}`;
+}
+
+function infoText(s, sampleRate, loops, renderedTracks, loopDetected, options) {
   return [
     `Used for: ${s.use}`,
     `Internal sequence: ${s.internal}`,
@@ -473,11 +486,65 @@ function infoText(s, sampleRate, loops, renderedTracks, loopDetected) {
     `Bank ID: ${s.fileInfo?.bankId ?? "unknown"}`,
     `Sample rate: ${sampleRate} Hz`,
     `Requested loops: ${loops}`,
+    `Separate instruments within a track: ${options.separateInstruments ? "yes" : "no"}`,
+    `Group duplicate instruments: ${options.groupDuplicateInstruments ? "yes" : "no"}`,
     `Loop boundary detected: ${loopDetected ? "yes" : "no (sequence ended naturally or safety cap was used)"}`,
-    `Rendered stems: ${renderedTracks.length ? renderedTracks.map((stem) => `Track ${stem.track + 1}: ${stem.name}${stem.details ? ` [${stem.details}]` : ""}`).join(" | ") : "none"}`,
+    `Rendered stems: ${renderedTracks.length ? renderedTracks.map((stem) => `${stemTrackText(stem)}: ${stem.name}${stem.details ? ` [${stem.details}]` : ""}`).join(" | ") : "none"}`,
     "",
     "Folder names describe in-game use. Internal names are kept only in this info file."
   ].join("\n");
+}
+
+function addFloatArrays(a, b) {
+  const length = Math.max(a?.length || 0, b?.length || 0);
+  const out = new Float32Array(length);
+  if (a) out.set(a);
+  if (b) {
+    for (let i = 0; i < b.length; i++) out[i] += b[i];
+  }
+  return out;
+}
+
+function groupDuplicateStemAudio(stems) {
+  const groups = new Map();
+
+  for (const stem of stems) {
+    const key = String(stem.name || "Unknown instrument").trim().toLowerCase();
+    if (!groups.has(key)) {
+      groups.set(key, {
+        ...stem,
+        tracks: [...new Set(stem.tracks?.length ? stem.tracks : [stem.track])],
+        left: Float32Array.from(stem.left),
+        right: Float32Array.from(stem.right),
+        groupedCount: 1
+      });
+      continue;
+    }
+
+    const target = groups.get(key);
+    target.left = addFloatArrays(target.left, stem.left);
+    target.right = addFloatArrays(target.right, stem.right);
+    target.tracks = [...new Set([
+      ...target.tracks,
+      ...(stem.tracks?.length ? stem.tracks : [stem.track])
+    ])].sort((a, b) => a - b);
+    target.groupedCount++;
+  }
+
+  return [...groups.values()].map((stem) => {
+    if (stem.groupedCount <= 1) return stem;
+    return {
+      ...stem,
+      track: stem.tracks[0],
+      details: `Grouped from ${stemTrackText(stem).toLowerCase()}`
+    };
+  });
+}
+
+function stemFileName(stem) {
+  const tracks = stem.tracks?.length ? stem.tracks : [stem.track];
+  if (tracks.length > 1) return `${safeName(stem.name)}.wav`;
+  return `${safeName(stem.name)} - Track ${String(tracks[0] + 1).padStart(2, "0")}.wav`;
 }
 
 function getWaveArchiveNamesForSequence(seq) {
@@ -509,6 +576,32 @@ function technicalInstrumentFallback(bank, program) {
     default:
       return `Bank instrument P${program}`;
   }
+}
+
+function resolveNoteInstrumentLabel(bank, channel, note, waveArchiveNames) {
+  const program = channel?.programNumber ?? 0;
+  const fallback = technicalInstrumentFallback(bank, program);
+  const resolved = channel?.getNoteInfo?.(note);
+
+  if (!resolved?.noteInfo) {
+    return { label: fallback, sample: "", mapped: false, playable: false };
+  }
+
+  if (resolved.isPSG || resolved.isWhiteNoise) {
+    return { label: fallback, sample: "", mapped: false, playable: true };
+  }
+
+  const archiveSlot = resolved.noteInfo.waveArchiveId;
+  const waveId = resolved.noteInfo.waveId;
+  const archiveName = waveArchiveNames[archiveSlot];
+  const mappedLabel = archiveName ? BW_SWAV_LABELS[archiveName]?.[waveId] : null;
+
+  return {
+    label: mappedLabel || fallback,
+    sample: archiveName ? `${archiveName} SWAV ${waveId}` : `SWAV ${waveId}`,
+    mapped: !!mappedLabel,
+    playable: true
+  };
 }
 
 function summarizeStemInstruments(bank, labelUsage, programUsage) {
@@ -550,7 +643,7 @@ function summarizeStemInstruments(bank, labelUsage, programUsage) {
   };
 }
 
-async function renderStem(seq, trackNo, sampleRate, requestedLoops) {
+async function renderStem(seq, trackNo, sampleRate, requestedLoops, instrumentFilter = null) {
   const file = Audio.SequenceRenderer.makeInfoSSEQ(state.sdat, seq.id);
   const leftChunks = [];
   const rightChunks = [];
@@ -568,42 +661,44 @@ async function renderStem(seq, trackNo, sampleRate, requestedLoops) {
     }
   });
 
-  // Resolve every note to the exact SWAR/SWAV it actually uses.
-  // The uploaded BW research table is keyed the same way, so labels come from
-  // the documented Sample Description rather than MIDI-program or pitch guesses.
   const waveArchiveNames = getWaveArchiveNamesForSequence(seq);
   const labelUsage = new Map();
   const programUsage = new Map();
   const originalPlayNote = renderer.synth.playNote.bind(renderer.synth);
+
   renderer.synth.playNote = (track, note, velocity, duration, trackInfo) => {
-    if (track === trackNo) {
-      const channel = renderer.synth.channels[track];
-      const program = channel?.programNumber ?? 0;
-      programUsage.set(program, (programUsage.get(program) || 0) + 1);
-
-      const resolved = channel?.getNoteInfo?.(note);
-      if (resolved?.noteInfo && !resolved.isPSG && !resolved.isWhiteNoise) {
-        const archiveSlot = resolved.noteInfo.waveArchiveId;
-        const waveId = resolved.noteInfo.waveId;
-        const archiveName = waveArchiveNames[archiveSlot];
-        const label = archiveName ? BW_SWAV_LABELS[archiveName]?.[waveId] : null;
-
-        if (label) {
-          const usage = labelUsage.get(label) || { count: 0, samples: new Set() };
-          usage.count++;
-          usage.samples.add(`${archiveName} SWAV ${waveId}`);
-          labelUsage.set(label, usage);
-        }
-      }
+    if (track !== trackNo) {
+      return originalPlayNote(track, note, velocity, duration, trackInfo);
     }
+
+    const channel = renderer.synth.channels[track];
+    const program = channel?.programNumber ?? 0;
+    const resolvedLabel = resolveNoteInstrumentLabel(file.bank, channel, note, waveArchiveNames);
+
+    if (instrumentFilter && resolvedLabel.label !== instrumentFilter) {
+      return;
+    }
+
+    programUsage.set(program, (programUsage.get(program) || 0) + 1);
+
+    if (resolvedLabel.playable) {
+      const usage = labelUsage.get(resolvedLabel.label) || {
+        count: 0,
+        samples: new Set(),
+        mapped: false
+      };
+      usage.count++;
+      usage.mapped ||= resolvedLabel.mapped;
+      if (resolvedLabel.sample) usage.samples.add(resolvedLabel.sample);
+      labelUsage.set(resolvedLabel.label, usage);
+    }
+
     return originalPlayNote(track, note, velocity, duration, trackInfo);
   };
 
   let loopsSeen = 0;
   let loopDetected = false;
 
-  // Hook the conductor track's Jump command so loop counting is based on the
-  // sequence's actual backwards control-flow jump, not elapsed seconds.
   const conductor = renderer.tracks[0];
   if (conductor?.handlers?.[0x94]) {
     const originalJump = conductor.handlers[0x94];
@@ -631,8 +726,6 @@ async function renderStem(seq, trackNo, sampleRate, requestedLoops) {
     }
   }
 
-  // Preserve the renderer's final not-yet-full sink buffer too, otherwise
-  // every stem can lose up to one 4096-frame chunk at its exact end point.
   if (renderer.synth?.pos > 0) {
     leftChunks.push(renderer.synth.buffer[0].slice(0, renderer.synth.pos));
     rightChunks.push(renderer.synth.buffer[1].slice(0, renderer.synth.pos));
@@ -641,14 +734,72 @@ async function renderStem(seq, trackNo, sampleRate, requestedLoops) {
   const left = mergeFloatChunks(leftChunks);
   const right = mergeFloatChunks(rightChunks);
   const instrument = summarizeStemInstruments(file.bank, labelUsage, programUsage);
+  const instrumentLabels = [...labelUsage.entries()]
+    .sort((a, b) => b[1].count - a[1].count || a[0].localeCompare(b[0]))
+    .map(([label]) => label);
+
   return {
     left,
     right,
     loopDetected,
     programs: [...programUsage.keys()],
-    instrumentName: instrument.name,
+    instrumentName: instrumentFilter || instrument.name,
     instrumentDetails: instrument.details,
-    instrumentMapped: instrument.mapped
+    instrumentMapped: instrument.mapped,
+    instrumentLabels
+  };
+}
+
+async function buildSongStems(song, sampleRate, loops, options, onProgress) {
+  const stems = [];
+  let loopDetected = false;
+
+  for (let track = 0; track < 16; track++) {
+    onProgress?.({ track, phase: "scan", label: "" });
+    const rendered = await renderStem(song, track, sampleRate, loops);
+    loopDetected ||= rendered.loopDetected;
+
+    if (audioPeak(rendered.left, rendered.right) <= 0.00002) {
+      await new Promise((resolve) => setTimeout(resolve, 0));
+      continue;
+    }
+
+    const labels = rendered.instrumentLabels || [];
+    if (options.separateInstruments && labels.length > 1) {
+      for (let i = 0; i < labels.length; i++) {
+        const label = labels[i];
+        onProgress?.({ track, phase: "split", label, part: i + 1, totalParts: labels.length });
+        const split = await renderStem(song, track, sampleRate, loops, label);
+        loopDetected ||= split.loopDetected;
+
+        if (audioPeak(split.left, split.right) > 0.00002) {
+          stems.push({
+            track,
+            tracks: [track],
+            name: label,
+            details: split.instrumentDetails || "",
+            left: split.left,
+            right: split.right
+          });
+        }
+      }
+    } else {
+      stems.push({
+        track,
+        tracks: [track],
+        name: rendered.instrumentName || "Unknown instrument",
+        details: rendered.instrumentDetails || "",
+        left: rendered.left,
+        right: rendered.right
+      });
+    }
+
+    await new Promise((resolve) => setTimeout(resolve, 0));
+  }
+
+  return {
+    stems: options.groupDuplicateInstruments ? groupDuplicateStemAudio(stems) : stems,
+    loopDetected
   };
 }
 
@@ -716,7 +867,7 @@ function renderMixerStems() {
     name.textContent = stem.name;
     const meta = document.createElement("div");
     meta.className = "stem-meta";
-    meta.textContent = `Track ${String(stem.track + 1).padStart(2, "0")} · ${formatTime(stem.buffer.duration)}${stem.details ? " · " + stem.details : ""}`;
+    meta.textContent = `${stemTrackText(stem)} · ${formatTime(stem.buffer.duration)}${stem.details ? " · " + stem.details : ""}`;
     label.append(name, meta);
 
     const muteLabel = document.createElement("label");
@@ -835,7 +986,6 @@ async function openMixer(song) {
   $("mixerSection").scrollIntoView({ behavior: "smooth", block: "start" });
 
   try {
-    // Create/resume from the button gesture so Chrome on iPad allows playback later.
     const ctx = await ensureAudioContext();
     clearMixer(false);
     state.mixer.song = song;
@@ -843,33 +993,32 @@ async function openMixer(song) {
     setBusy(true);
     const sampleRate = Number($("sampleRate").value);
     const loops = Number($("loopCount").value);
+    const options = getRenderOptions();
+
+    const built = await buildSongStems(song, sampleRate, loops, options, (progress) => {
+      const trackText = `track ${progress.track + 1}/16`;
+      $("mixerStatus").textContent = progress.phase === "split"
+        ? `Separating ${trackText}: ${progress.label} (${progress.part}/${progress.totalParts})…`
+        : `Rendering ${trackText}…`;
+    });
+
     const stems = [];
+    for (const rendered of built.stems) {
+      const frames = Math.min(rendered.left.length, rendered.right.length);
+      const buffer = ctx.createBuffer(2, frames, sampleRate);
+      buffer.copyToChannel(rendered.left.subarray(0, frames), 0);
+      buffer.copyToChannel(rendered.right.subarray(0, frames), 1);
 
-    for (let track = 0; track < 16; track++) {
-      $("mixerStatus").textContent = `Rendering stem ${track + 1}/16…`;
-      const rendered = await renderStem(song, track, sampleRate, loops);
+      const gain = ctx.createGain();
+      gain.connect(ctx.destination);
 
-      if (audioPeak(rendered.left, rendered.right) > 0.00002) {
-        const frames = Math.min(rendered.left.length, rendered.right.length);
-        const buffer = ctx.createBuffer(2, frames, sampleRate);
-        buffer.copyToChannel(rendered.left.subarray(0, frames), 0);
-        buffer.copyToChannel(rendered.right.subarray(0, frames), 1);
-
-        const gain = ctx.createGain();
-        gain.connect(ctx.destination);
-
-        stems.push({
-          track,
-          name: rendered.instrumentName || "Unknown instrument",
-          details: rendered.instrumentDetails || "",
-          buffer,
-          gain,
-          muted: false,
-          volume: 1
-        });
-      }
-
-      await new Promise((resolve) => setTimeout(resolve, 0));
+      stems.push({
+        ...rendered,
+        buffer,
+        gain,
+        muted: false,
+        volume: 1
+      });
     }
 
     state.mixer.stems = stems;
@@ -879,8 +1028,14 @@ async function openMixer(song) {
     renderMixerStems();
     updateMixerSeek(0);
     $("mixerTransport").classList.remove("hidden");
+
+    const modes = [];
+    if (options.separateInstruments) modes.push("instruments separated");
+    if (options.groupDuplicateInstruments) modes.push("duplicates grouped");
+    const modeText = modes.length ? ` · ${modes.join(" · ")}` : "";
+
     $("mixerStatus").textContent = stems.length
-      ? `Ready · ${stems.length} audible stem${stems.length === 1 ? "" : "s"} · ${loops} loop${loops === 1 ? "" : "s"}`
+      ? `Ready · ${stems.length} audible stem${stems.length === 1 ? "" : "s"} · ${loops} loop${loops === 1 ? "" : "s"}${modeText}`
       : "No audible stems were found.";
   } catch (err) {
     console.error(err);
@@ -900,48 +1055,39 @@ async function exportSongs(songs) {
   setBusy(true);
   const sampleRate = Number($("sampleRate").value);
   const loops = Number($("loopCount").value);
+  const options = getRenderOptions();
   const zipEntries = [];
 
   try {
-    let completedUnits = 0;
     const totalUnits = songs.length * 16;
 
     for (let songIndex = 0; songIndex < songs.length; songIndex++) {
       const s = songs[songIndex];
       const folderPath = sequenceFolder(s);
-      const renderedTracks = [];
-      let anyLoopDetected = false;
 
-      for (let track = 0; track < 16; track++) {
+      const built = await buildSongStems(s, sampleRate, loops, options, (progress) => {
+        const baseProgress = (songIndex * 16 + progress.track) / totalUnits;
+        const phaseText = progress.phase === "split"
+          ? `track ${progress.track + 1}/16 · ${progress.label} (${progress.part}/${progress.totalParts})`
+          : `track ${progress.track + 1}/16`;
+
         setProgress(
-          completedUnits / totalUnits,
-          `${s.baseUse}${s.variant ? " — " + s.variant : ""}: track ${track + 1}/16`
+          Math.min(0.98, baseProgress),
+          `${s.baseUse}${s.variant ? " — " + s.variant : ""}: ${phaseText}`
         );
+      });
 
-        const rendered = await renderStem(s, track, sampleRate, loops);
-        anyLoopDetected ||= rendered.loopDetected;
-
-        if (audioPeak(rendered.left, rendered.right) > 0.00002) {
-          const wav = interleaveToWav(rendered.left, rendered.right, sampleRate);
-          const instrumentName = rendered.instrumentName || "Unknown instrument";
-          zipEntries.push(makeZipEntry(
-            `${folderPath}/${safeName(instrumentName)} - Track ${String(track + 1).padStart(2, "0")}.wav`,
-            wav
-          ));
-          renderedTracks.push({
-            track,
-            name: instrumentName,
-            details: rendered.instrumentDetails || ""
-          });
-        }
-
-        completedUnits++;
-        await new Promise((resolve) => setTimeout(resolve, 0));
+      for (const stem of built.stems) {
+        const wav = interleaveToWav(stem.left, stem.right, sampleRate);
+        zipEntries.push(makeZipEntry(
+          `${folderPath}/${stemFileName(stem)}`,
+          wav
+        ));
       }
 
       zipEntries.push(makeZipEntry(
         `${folderPath}/info.txt`,
-        infoText(s, sampleRate, loops, renderedTracks, anyLoopDetected)
+        infoText(s, sampleRate, loops, built.stems, built.loopDetected, options)
       ));
     }
 
