@@ -15,8 +15,8 @@ A static, client-side GitHub Pages tool for extracting music stems from a user-s
 - Groups known seasonal and Black/White variants under usage-based names.
 - Uses `nitro-fs`'s SSEQ renderer and `activeTracks` mask to render individual sequence tracks as separate WAV stems.
 - Omits silent sequence tracks.
-- Generates ZIP files with `info.txt` containing the original internal sequence name/ID.
-- Uses small batches so iOS/iPadOS Safari is less likely to run out of memory.
+- Generates one ZIP for all selected songs, with `info.txt` files containing the original internal sequence name/ID.
+- Lets you choose a loop count: intro once, followed by exactly that many complete loop passes. Non-looping tracks render once.
 
 ## GitHub Pages
 
