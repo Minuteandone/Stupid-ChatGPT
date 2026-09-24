@@ -18,18 +18,17 @@ A static GitHub Pages tool that processes a user-selected Pokémon Black or Whit
 - Lets you choose a loop count: intro once, then exactly N complete loop passes.
 - Renders non-looping sequences to their natural end.
 - Exports usage-named folders with `info.txt` files containing internal sequence IDs/names.
-- Uses small ZIP batches to reduce memory pressure on iPad/Safari.
+- Uses a direct store-only ZIP writer to reduce packing time and memory pressure on iPad browsers.
 - Can optionally include short fanfares/jingles.
 
 ## GitHub Pages
 
-The Pages workflow deploys from `main` using GitHub Actions. The current site code is split into four text chunks under `app.parts/`; the small `app.js` loader reassembles them in the browser before running the extractor.
+The Pages workflow deploys from `main` using GitHub Actions. The site is static and runs the extractor entirely in the browser.
 
 ## Dependencies
 
 Loaded in the browser as ES modules:
 
 - [`nitro-fs`](https://github.com/DanielPXL/nitro-fs) (LGPL-3.0-or-later)
-- [`JSZip`](https://stuk.github.io/jszip/) (MIT)
 
 No ROM or game-audio data is stored in this repository.
