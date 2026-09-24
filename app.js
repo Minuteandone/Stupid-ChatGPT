@@ -473,39 +473,120 @@ function infoText(s, sampleRate, loops, renderedTracks, loopDetected) {
     `Sample rate: ${sampleRate} Hz`,
     `Requested loops: ${loops}`,
     `Loop boundary detected: ${loopDetected ? "yes" : "no (sequence ended naturally or safety cap was used)"}`,
-    `Rendered stems: ${renderedTracks.length ? renderedTracks.map((stem) => `Track ${stem.track + 1}: ${stem.name}`).join(" | ") : "none"}`,
+    `Rendered stems: ${renderedTracks.length ? renderedTracks.map((stem) => `Track ${stem.track + 1}: ${stem.name}${stem.details ? ` [${stem.details}]` : ""}`).join(" | ") : "none"}`,
     "",
     "Folder names describe in-game use. Internal names are kept only in this info file."
   ].join("\n");
 }
 
-function describeInstrumentProgram(bank, program) {
+function medianValue(values) {
+  if (!values?.length) return null;
+  const sorted = [...values].sort((a, b) => a - b);
+  const middle = Math.floor(sorted.length / 2);
+  return sorted.length % 2
+    ? sorted[middle]
+    : (sorted[middle - 1] + sorted[middle]) / 2;
+}
+
+function describeInstrumentProgram(bank, program, notes = []) {
   const instrument = bank?.instruments?.[program];
-  if (!instrument) return `Unknown instrument P${program}`;
+  const median = medianValue(notes);
+  const low = notes.length ? Math.min(...notes) : null;
+  const high = notes.length ? Math.max(...notes) : null;
+  const noteRange = low === null ? "" : ` · notes ${low}-${high}`;
+
+  if (!instrument) {
+    return {
+      program,
+      name: `Unknown bank instrument`,
+      details: `P${program}${noteRange}`
+    };
+  }
 
   switch (instrument.type) {
     case Audio.InstrumentType.DrumSet:
-      return `Drum kit P${program}`;
-    case Audio.InstrumentType.PSG:
-      return `PSG synth P${program}`;
+      return {
+        program,
+        name: "Drum kit",
+        details: `P${program} · drum keys ${instrument.lowerKey}-${instrument.upperKey}${noteRange}`
+      };
+
+    case Audio.InstrumentType.PSG: {
+      const duty = instrument.noteInfo?.waveId;
+      const bass = median !== null && median <= 47;
+      return {
+        program,
+        name: bass ? "PSG pulse bass" : "PSG pulse synth",
+        details: `P${program} · PSG duty ${duty ?? "?"}${noteRange}`
+      };
+    }
+
     case Audio.InstrumentType.WhiteNoise:
-      return `Noise percussion P${program}`;
-    case Audio.InstrumentType.KeySplit:
-      return `Key-split sampled instrument P${program}`;
+      return {
+        program,
+        name: "Noise percussion",
+        details: `P${program}${noteRange}`
+      };
+
+    case Audio.InstrumentType.KeySplit: {
+      const bass = median !== null && median <= 47;
+      return {
+        program,
+        name: bass ? "Bass-range key-split multisample" : "Key-split multisample",
+        details: `P${program} · ${instrument.instruments?.length ?? "?"} regions${noteRange}`
+      };
+    }
+
     case Audio.InstrumentType.PCM:
-    case Audio.InstrumentType.DirectPCM:
-      return `Sampled instrument P${program}`;
+    case Audio.InstrumentType.DirectPCM: {
+      const info = instrument.noteInfo;
+      let name = "Sampled PCM instrument";
+      if (median !== null && median <= 47) name = "Sampled bass-range instrument";
+      else if (median !== null && median >= 76) name = "Sampled high-range instrument";
+
+      return {
+        program,
+        name,
+        details: `P${program} · wave archive ${info?.waveArchiveId ?? "?"} · sample ${info?.waveId ?? "?"}${noteRange}`
+      };
+    }
+
     default:
-      return `Instrument P${program}`;
+      return {
+        program,
+        name: "Bank instrument",
+        details: `P${program} · type ${instrument.type}${noteRange}`
+      };
   }
 }
 
-function describeStemPrograms(bank, programCounts) {
-  const used = [...programCounts.entries()]
-    .sort((a, b) => b[1] - a[1] || a[0] - b[0])
-    .map(([program]) => describeInstrumentProgram(bank, program));
+function describeStemPrograms(bank, programUsage) {
+  const descriptors = [...programUsage.entries()]
+    .sort((a, b) => b[1].count - a[1].count || a[0] - b[0])
+    .map(([program, usage]) => describeInstrumentProgram(bank, program, usage.notes));
 
-  return used.length ? used.join(" + ") : "Unknown instrument";
+  if (!descriptors.length) {
+    return {
+      name: "Unknown instrument",
+      details: "No note-producing bank program was observed"
+    };
+  }
+
+  const uniqueNames = [...new Set(descriptors.map((item) => item.name))];
+  let name;
+  if (uniqueNames.length === 1) {
+    name = uniqueNames[0];
+    if (descriptors.length > 1) name += " (multiple programs)";
+  } else {
+    name = uniqueNames.slice(0, 2).join(" + ");
+    if (uniqueNames.length > 2) name += " + more";
+  }
+
+  return {
+    name,
+    details: descriptors.map((item) => item.details).join(" | "),
+    descriptors
+  };
 }
 
 async function renderStem(seq, trackNo, sampleRate, requestedLoops) {
@@ -529,12 +610,15 @@ async function renderStem(seq, trackNo, sampleRate, requestedLoops) {
   // Record only programs that actually produce notes on this stem.
   // Program numbers are bank-local; the SDAT does not contain friendly names
   // such as "piano", so labels stick to the instrument type the bank exposes.
-  const programCounts = new Map();
+  const programUsage = new Map();
   const originalPlayNote = renderer.synth.playNote.bind(renderer.synth);
   renderer.synth.playNote = (track, note, velocity, duration, trackInfo) => {
     if (track === trackNo) {
       const program = renderer.synth.channels[track]?.programNumber ?? 0;
-      programCounts.set(program, (programCounts.get(program) || 0) + 1);
+      const usage = programUsage.get(program) || { count: 0, notes: [] };
+      usage.count++;
+      usage.notes.push(note);
+      programUsage.set(program, usage);
     }
     return originalPlayNote(track, note, velocity, duration, trackInfo);
   };
@@ -580,12 +664,15 @@ async function renderStem(seq, trackNo, sampleRate, requestedLoops) {
 
   const left = mergeFloatChunks(leftChunks);
   const right = mergeFloatChunks(rightChunks);
+  const instrument = describeStemPrograms(file.bank, programUsage);
   return {
     left,
     right,
     loopDetected,
-    programs: [...programCounts.keys()],
-    instrumentName: describeStemPrograms(file.bank, programCounts)
+    programs: [...programUsage.keys()],
+    instrumentName: instrument.name,
+    instrumentDetails: instrument.details,
+    instrumentDescriptors: instrument.descriptors || []
   };
 }
 
@@ -653,7 +740,7 @@ function renderMixerStems() {
     name.textContent = stem.name;
     const meta = document.createElement("div");
     meta.className = "stem-meta";
-    meta.textContent = `Track ${String(stem.track + 1).padStart(2, "0")} · ${formatTime(stem.buffer.duration)}`;
+    meta.textContent = `Track ${String(stem.track + 1).padStart(2, "0")} · ${formatTime(stem.buffer.duration)}${stem.details ? " · " + stem.details : ""}`;
     label.append(name, meta);
 
     const muteLabel = document.createElement("label");
@@ -798,6 +885,7 @@ async function openMixer(song) {
         stems.push({
           track,
           name: rendered.instrumentName || "Unknown instrument",
+          details: rendered.instrumentDetails || "",
           buffer,
           gain,
           muted: false,
@@ -864,7 +952,11 @@ async function exportSongs(songs) {
             `${folderPath}/${safeName(instrumentName)} - Track ${String(track + 1).padStart(2, "0")}.wav`,
             wav
           ));
-          renderedTracks.push({ track, name: instrumentName });
+          renderedTracks.push({
+            track,
+            name: instrumentName,
+            details: rendered.instrumentDetails || ""
+          });
         }
 
         completedUnits++;
