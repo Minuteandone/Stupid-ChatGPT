@@ -219,5 +219,10 @@ export const SONG_USAGE = {
   "SEQ_BGM_MSL_DL_02": "Pokémon Musical - downloadable slot 2 placeholder",
   "SEQ_BGM_MSL_DL_03": "Pokémon Musical - downloadable slot 3 placeholder",
   "SEQ_BGM_MSL_DL_04": "Pokémon Musical - downloadable slot 4 placeholder",
-  "SEQ_BGM_END": "Unused / end marker music sequence"
+  "SEQ_BGM_END": "Unused / end marker music sequence",
+  "SEQ_ME_POKEGET": "Received a Pokémon",
+  "SEQ_ME_QUIZ": "Quiz result / quiz fanfare",
+  "SEQ_ME_DEL_POWER": "Pass Power / Entralink power ended",
+  "SEQ_ME_02": "Pokémon healed - duplicate alias",
+  "SEQ_ME_END": "Pokémon healed - end-marker alias"
 };
