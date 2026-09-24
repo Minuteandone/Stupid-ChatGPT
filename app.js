@@ -420,16 +420,18 @@ async function exportSongs(songs) {
     }
 
     setProgress(0.985, "Packing one ZIP…");
+    // PCM WAV stems are already enormous and don't benefit enough from
+    // CPU-heavy DEFLATE to justify the wait on iPad/Safari.
+    // STORE makes the ZIP larger but turns this step into mostly file assembly.
     const blob = await zip.generateAsync(
       {
         type: "blob",
-        compression: "DEFLATE",
-        compressionOptions: { level: 4 },
+        compression: "STORE",
         streamFiles: true
       },
       (meta) => {
         const pct = 0.985 + (meta.percent / 100) * 0.015;
-        setProgress(pct, "Packing one ZIP…");
+        setProgress(pct, "Packing one ZIP (fast / no compression)…");
       }
     );
 
