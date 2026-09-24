@@ -1,0 +1,170 @@
+      if (typeof originalJump === "function") {
+        track.handlers[0x94] = function (cmd) {
+          const from = this.pointer;
+          const to = cmd.offset;
+          if (Number.isFinite(to) && to <= from) {
+            const shouldStop = onBackwardJump({ track: this.track, from, to, trackObject: this, cmd });
+            if (shouldStop) {
+              this.wait = -1;
+              return;
+            }
+          }
+          return originalJump.call(this, cmd);
+        };
+      }
+      track.__stemJumpPatched = true;
+    }
+
+    if (!track.__stemOpenTrackPatched) {
+      const originalOpenTrack = track.handlers?.[0x93];
+      if (typeof originalOpenTrack === "function") {
+        track.handlers[0x93] = function (cmd) {
+          const result = originalOpenTrack.call(this, cmd);
+          patchJumpHandlers(renderer, onBackwardJump);
+          return result;
+        };
+      }
+      track.__stemOpenTrackPatched = true;
+    }
+  }
+}
+
+async function detectLoopSignature(fileInfo, sampleRate, cacheId) {
+  const cacheKey = String(cacheId);
+  if (state.loopCache.has(cacheKey)) return state.loopCache.get(cacheKey);
+
+  let signature = null;
+  let hit = false;
+  const renderer = new Audio.SequenceRenderer({
+    file: fileInfo,
+    sampleRate: Math.min(8000, sampleRate),
+    activeTracks: 0,
+    bufferLength: 256,
+    seed: 1,
+    sink: () => {},
+  });
+
+  let ticks = 0;
+  while (!hit && !rendererFinished(renderer) && renderer.synth.time < MAX_RENDER_SECONDS) {
+    patchJumpHandlers(renderer, ({ track, from, to }) => {
+      signature = `${track}:${from}->${to}`;
+      hit = true;
+      return true;
+    });
+    renderer.tick();
+    ticks++;
+    if ((ticks & 0x1fff) === 0) await yieldToBrowser();
+  }
+
+  state.loopCache.set(cacheKey, signature);
+  return signature;
+}
+
+function appendPcmChunk(target, left, right, length = left.length) {
+  const pcm = new Int16Array(length * 2);
+  let peak = 0;
+  for (let i = 0; i < length; i++) {
+    const l = Math.max(-1, Math.min(1, left[i] || 0));
+    const r = Math.max(-1, Math.min(1, right[i] || 0));
+    peak = Math.max(peak, Math.abs(l), Math.abs(r));
+    pcm[i * 2] = l < 0 ? Math.round(l * 32768) : Math.round(l * 32767);
+    pcm[i * 2 + 1] = r < 0 ? Math.round(r * 32768) : Math.round(r * 32767);
+  }
+  target.chunks.push(pcm);
+  target.frames += length;
+  target.peak = Math.max(target.peak, peak);
+}
+
+function wavFromPcm(chunks, frames, sampleRate) {
+  const bytesPerFrame = 4;
+  const dataBytes = frames * bytesPerFrame;
+  const out = new ArrayBuffer(44 + dataBytes);
+  const view = new DataView(out);
+  const bytes = new Uint8Array(out);
+  const writeText = (offset, text) => { for (let i = 0; i < text.length; i++) bytes[offset + i] = text.charCodeAt(i); };
+  writeText(0, "RIFF");
+  view.setUint32(4, 36 + dataBytes, true);
+  writeText(8, "WAVE");
+  writeText(12, "fmt ");
+  view.setUint32(16, 16, true);
+  view.setUint16(20, 1, true);
+  view.setUint16(22, 2, true);
+  view.setUint32(24, sampleRate, true);
+  view.setUint32(28, sampleRate * bytesPerFrame, true);
+  view.setUint16(32, bytesPerFrame, true);
+  view.setUint16(34, 16, true);
+  writeText(36, "data");
+  view.setUint32(40, dataBytes, true);
+
+  let byteOffset = 44;
+  for (const chunk of chunks) {
+    bytes.set(new Uint8Array(chunk.buffer, chunk.byteOffset, chunk.byteLength), byteOffset);
+    byteOffset += chunk.byteLength;
+  }
+  return out;
+}
+
+async function renderStem(fileInfo, activeTrack, loops, sampleRate, loopSignature) {
+  const pcm = { chunks: [], frames: 0, peak: 0 };
+  let stopAtLoopBoundary = false;
+  let seenLoops = 0;
+
+  const renderer = new Audio.SequenceRenderer({
+    file: fileInfo,
+    sampleRate,
+    activeTracks: 1 << activeTrack,
+    bufferLength: RENDER_BUFFER_FRAMES,
+    seed: 1,
+    sink: (buffer) => appendPcmChunk(pcm, buffer[0], buffer[1]),
+  });
+
+  let ticks = 0;
+  while (!rendererFinished(renderer) && renderer.synth.time < MAX_RENDER_SECONDS) {
+    patchJumpHandlers(renderer, ({ track, from, to }) => {
+      const sig = `${track}:${from}->${to}`;
+      if (loopSignature && sig === loopSignature) {
+        seenLoops++;
+        if (seenLoops >= loops) {
+          stopAtLoopBoundary = true;
+          return true;
+        }
+      }
+      return false;
+    });
+
+    renderer.tick();
+    if (stopAtLoopBoundary) {
+      for (let i = 0; i < renderer.tracks.length; i++) renderer.tracks[i] = null;
+      break;
+    }
+
+    ticks++;
+    if ((ticks & 0x0fff) === 0) await yieldToBrowser();
+  }
+
+  const pos = renderer.synth.pos || 0;
+  if (pos > 0) appendPcmChunk(pcm, renderer.synth.buffer[0], renderer.synth.buffer[1], pos);
+
+  if (pcm.peak < 0.00002 || pcm.frames === 0) return null;
+  return {
+    wav: wavFromPcm(pcm.chunks, pcm.frames, sampleRate),
+    frames: pcm.frames,
+    seconds: pcm.frames / sampleRate,
+    peak: pcm.peak,
+    looped: Boolean(loopSignature),
+    emergencyCut: renderer.synth.time >= MAX_RENDER_SECONDS,
+  };
+}
+
+function sanitizeName(value) {
+  return String(value || "Untitled")
+    .replace(/[\\/:*?"<>|]/g, " - ")
+    .replace(/\s+/g, " ")
+    .replace(/[. ]+$/g, "")
+    .slice(0, 120) || "Untitled";
+}
+
+function downloadBlob(blob, filename) {
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement("a");
+  a.href = url;
