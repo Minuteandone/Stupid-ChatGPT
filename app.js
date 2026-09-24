@@ -23,7 +23,11 @@ function safeName(text) {
 
 function classifySequence(seq) {
   const internal = seq.name || `SEQ_${seq.id}`;
-  const use = SONG_USAGE[internal] || humanizeInternal(internal);
+  const use = SONG_USAGE[internal] || (
+    internal.startsWith("SEQ_ME_")
+      ? `Unidentified fanfare (${internal})`
+      : humanizeInternal(internal)
+  );
   const match = use.match(VARIANT_RE);
 
   let baseUse = use;
