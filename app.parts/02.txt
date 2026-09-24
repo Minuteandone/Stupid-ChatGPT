@@ -1,0 +1,170 @@
+    const reference = cleanReferenceLabel(SONG_USAGE[name]);
+    let label = useLabel(name, reference);
+    let groupLabel = label;
+    let variant = "";
+    let family = name;
+
+    const season = name.match(/_(SP|SU|AU|WI)$/);
+    if (season) {
+      family = name.slice(0, -3);
+      variant = SEASONS[season[1]];
+      groupLabel = stripVariantText(useLabel(name, reference));
+    }
+
+    const version = name.match(/_(B|W)$/);
+    if (version) {
+      const other = `${name.slice(0, -1)}${version[1] === "B" ? "W" : "B"}`;
+      if (names.has(other)) {
+        family = name.slice(0, -2);
+        const thisRef = cleanReferenceLabel(SONG_USAGE[name]);
+        const otherRef = cleanReferenceLabel(SONG_USAGE[other]);
+        const thisBase = stripVariantText(thisRef);
+        const otherBase = stripVariantText(otherRef);
+        if (thisBase && otherBase && thisBase !== otherBase) {
+          const blackRef = version[1] === "B" ? thisBase : otherBase;
+          const whiteRef = version[1] === "W" ? thisBase : otherBase;
+          groupLabel = `${blackRef} / ${whiteRef}`;
+          variant = `${version[1] === "B" ? "Black" : "White"} version — ${thisBase}`;
+        } else {
+          groupLabel = stripVariantText(label);
+          variant = `${version[1] === "B" ? "Black" : "White"} version`;
+        }
+      }
+    }
+
+    const floor = name.match(/_(B[123]F)$/);
+    if (floor) {
+      const base = name.slice(0, -(floor[1].length + 1));
+      if (names.has(base)) {
+        family = base;
+        groupLabel = stripVariantText(useLabel(base, cleanReferenceLabel(SONG_USAGE[base])));
+        variant = floor[1];
+      }
+    } else {
+      const b1 = `${name}_B1F`;
+      const b2 = `${name}_B2F`;
+      if (names.has(b1) || names.has(b2)) {
+        family = name;
+        groupLabel = stripVariantText(label);
+        variant = "Main area";
+      }
+    }
+
+    return {
+      id: seq.id,
+      name,
+      fileInfo: seq.fileInfo,
+      kind: name.startsWith("SEQ_ME_") ? "jingle" : "bgm",
+      reference,
+      label,
+      groupLabel,
+      variant,
+      family,
+    };
+  });
+
+  const seasonFamilies = new Map();
+  for (const item of result) {
+    if (item.variant && Object.values(SEASONS).includes(item.variant)) {
+      if (!seasonFamilies.has(item.family)) seasonFamilies.set(item.family, []);
+      seasonFamilies.get(item.family).push(item);
+    }
+  }
+  for (const members of seasonFamilies.values()) {
+    const refs = members.map((m) => stripVariantText(m.reference)).filter(Boolean);
+    const common = refs.find((x) => refs.every((y) => y === x)) || refs[0];
+    if (common) members.forEach((m) => { m.groupLabel = common; });
+  }
+
+  return result.sort((a, b) => a.groupLabel.localeCompare(b.groupLabel) || a.variant.localeCompare(b.variant) || a.id - b.id);
+}
+
+function visibleSongs() {
+  const q = searchInput.value.trim().toLowerCase();
+  const jingles = includeJingles.checked;
+  return state.songs.filter((song) => {
+    if (song.kind === "jingle" && !jingles) return false;
+    if (!q) return true;
+    return `${song.groupLabel} ${song.variant} ${song.label} ${song.name}`.toLowerCase().includes(q);
+  });
+}
+
+function renderCatalog() {
+  const visible = visibleSongs();
+  catalog.innerHTML = "";
+  countBadge.textContent = `${visible.length} shown · ${state.selected.size} selected`;
+  catalogTitle.textContent = includeJingles.checked ? "Music + jingles" : "Music";
+
+  const fragment = document.createDocumentFragment();
+  for (const song of visible) {
+    const row = document.createElement("label");
+    row.className = "song";
+
+    const check = document.createElement("input");
+    check.type = "checkbox";
+    check.checked = state.selected.has(song.id);
+    check.disabled = state.busy;
+    check.addEventListener("change", () => {
+      if (check.checked) state.selected.add(song.id); else state.selected.delete(song.id);
+      countBadge.textContent = `${visibleSongs().length} shown · ${state.selected.size} selected`;
+    });
+
+    const text = document.createElement("div");
+    const title = document.createElement("div");
+    title.className = "song-name";
+    title.textContent = song.groupLabel;
+    const meta = document.createElement("div");
+    meta.className = "song-meta";
+    meta.textContent = `SSEQ ${song.id} · bank ${song.fileInfo?.bankId ?? "?"}`;
+    text.append(title, meta);
+
+    row.append(check, text);
+    if (song.variant) {
+      const badge = document.createElement("span");
+      badge.className = "variant";
+      badge.textContent = song.variant;
+      row.appendChild(badge);
+    }
+    fragment.appendChild(row);
+  }
+  catalog.appendChild(fragment);
+}
+
+function setBusy(busy) {
+  state.busy = busy;
+  romInput.disabled = busy;
+  for (const el of [includeJingles, searchInput, loopCount, sampleRateSelect, batchSizeSelect, selectVisible, clearSelection, exportSelected, exportNext]) {
+    el.disabled = busy;
+  }
+  renderCatalog();
+}
+
+function updateProgress(done, total, text) {
+  progressWrap.classList.remove("hidden");
+  const ratio = total ? Math.max(0, Math.min(1, done / total)) : 0;
+  progress.value = ratio;
+  progressText.textContent = text;
+  progressPct.textContent = `${Math.round(ratio * 100)}%`;
+}
+
+function hideProgress() {
+  progressWrap.classList.add("hidden");
+  progress.value = 0;
+}
+
+function yieldToBrowser() {
+  return new Promise((resolve) => setTimeout(resolve, 0));
+}
+
+function rendererFinished(renderer) {
+  const tracksDone = !renderer.tracks.some(Boolean);
+  if (!tracksDone) return false;
+  return renderer.synth.channels.every((ch) => !ch.playing?.some(Boolean));
+}
+
+function patchJumpHandlers(renderer, onBackwardJump) {
+  for (const track of renderer.tracks) {
+    if (!track) continue;
+
+    if (!track.__stemJumpPatched) {
+      const originalJump = track.handlers?.[0x94];
