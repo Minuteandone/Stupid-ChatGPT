@@ -51,6 +51,17 @@
         <label class="toggle"><input id="includeJingles" type="checkbox" /> include short fanfares/jingles</label>
       </div>
 
+      <div class="render-options">
+        <label class="toggle option-card">
+          <input id="separateInstruments" type="checkbox" />
+          <span><strong>Separate instruments within a track</strong><small>Split one SSEQ track into separate stems when it changes or combines labeled instruments.</small></span>
+        </label>
+        <label class="toggle option-card">
+          <input id="groupDuplicateInstruments" type="checkbox" />
+          <span><strong>Group duplicate instruments</strong><small>Merge stems with the same instrument label across tracks into one combined stem.</small></span>
+        </label>
+      </div>
+
       <div class="actions">
         <button id="selectVisible" class="secondary">Select visible</button>
         <button id="clearSelection" class="secondary">Clear</button>
@@ -103,7 +114,7 @@
 
     <section class="card smallprint">
       <h2>What counts as a stem?</h2>
-      <p>Each DS SSEQ can use up to 16 sequencer tracks. This page renders each active SSEQ track separately using the game’s own instrument banks and wave archives. Silent tracks are discarded automatically.</p>
+      <p>Each DS SSEQ can use up to 16 sequencer tracks. By default this page renders each active track separately. You can optionally split different instruments inside a track, group duplicate instrument labels across tracks, or use both together. Silent stems are discarded automatically.</p>
       <p>For looping music, the page keeps the one-time intro and then renders exactly the number of complete loops you choose. Non-looping sequences render once. A hidden safety cap prevents malformed sequences from running forever.</p>
       <p class="muted">The ROM is processed locally with <a href="https://github.com/DanielPXL/nitro-fs">nitro-fs</a>. This site does not include ROMs or game audio.</p>
     </section>
