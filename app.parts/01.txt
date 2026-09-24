@@ -1,0 +1,170 @@
+import { BufferReader, Audio } from "https://cdn.jsdelivr.net/npm/nitro-fs@1.1.1/+esm";
+import JSZip from "https://cdn.jsdelivr.net/npm/jszip@3.10.1/+esm";
+const { SONG_USAGE } = await import(new URL("./catalog.js", location.href).href);
+
+const $ = (id) => document.getElementById(id);
+const romInput = $("romInput");
+const romStatus = $("romStatus");
+const controls = $("controls");
+const catalogSection = $("catalogSection");
+const catalog = $("catalog");
+const catalogTitle = $("catalogTitle");
+const countBadge = $("countBadge");
+const includeJingles = $("includeJingles");
+const searchInput = $("search");
+const loopCount = $("loopCount");
+const sampleRateSelect = $("sampleRate");
+const batchSizeSelect = $("batchSize");
+const selectVisible = $("selectVisible");
+const clearSelection = $("clearSelection");
+const exportSelected = $("exportSelected");
+const exportNext = $("exportNext");
+const progressWrap = $("progressWrap");
+const progress = $("progress");
+const progressText = $("progressText");
+const progressPct = $("progressPct");
+
+const decoder = new TextDecoder("ascii");
+const SEASONS = { SP: "Spring", SU: "Summer", AU: "Autumn", WI: "Winter" };
+const MAX_RENDER_SECONDS = 600;
+const RENDER_BUFFER_FRAMES = 512;
+
+const state = {
+  sdat: null,
+  romName: "",
+  gameTitle: "",
+  gameCode: "",
+  songs: [],
+  selected: new Set(),
+  exported: new Set(),
+  busy: false,
+  loopCache: new Map(),
+};
+
+function setStatus(message, kind = "") {
+  romStatus.textContent = message;
+  romStatus.className = `status ${kind}`.trim();
+}
+
+function readAscii(bytes, start, length) {
+  return decoder.decode(bytes.slice(start, start + length)).replace(/\0+$/g, "").trim();
+}
+
+function u32(view, offset) {
+  return view.getUint32(offset, true);
+}
+
+function findNitroFile(rom, preferredName = "wb_sound_data.sdat") {
+  const romView = new DataView(rom);
+  if (rom.byteLength < 0x50) throw new Error("This file is too small to be a Nintendo DS ROM.");
+
+  const fntOffset = u32(romView, 0x40);
+  const fntLength = u32(romView, 0x44);
+  const fatOffset = u32(romView, 0x48);
+  const fatLength = u32(romView, 0x4c);
+
+  if (!fntOffset || !fatOffset || fntOffset + fntLength > rom.byteLength || fatOffset + fatLength > rom.byteLength) {
+    throw new Error("The Nintendo DS filesystem tables look invalid.");
+  }
+
+  const fnt = new Uint8Array(rom, fntOffset, fntLength);
+  const fntView = new DataView(rom, fntOffset, fntLength);
+  const seen = new Set();
+  let fallback = null;
+
+  function walk(dirId, prefix) {
+    const dirIndex = (dirId & 0x0fff) * 8;
+    if (dirIndex + 8 > fntLength || seen.has(dirId)) return null;
+    seen.add(dirId);
+
+    let cursor = fntView.getUint32(dirIndex, true);
+    let fileId = fntView.getUint16(dirIndex + 4, true);
+    if (cursor >= fntLength) return null;
+
+    while (cursor < fntLength) {
+      const marker = fnt[cursor++];
+      if (marker === 0) break;
+      const isDirectory = (marker & 0x80) !== 0;
+      const nameLength = marker & 0x7f;
+      if (!nameLength || cursor + nameLength > fntLength) break;
+      const name = decoder.decode(fnt.slice(cursor, cursor + nameLength));
+      cursor += nameLength;
+
+      if (isDirectory) {
+        if (cursor + 2 > fntLength) break;
+        const childId = fntView.getUint16(cursor, true);
+        cursor += 2;
+        const found = walk(childId, `${prefix}${name}/`);
+        if (found?.preferred) return found;
+        if (!fallback && found?.fallback) fallback = found.fallback;
+      } else {
+        const path = `${prefix}${name}`;
+        if (name.toLowerCase() === preferredName.toLowerCase()) {
+          return { preferred: { fileId, path } };
+        }
+        if (!fallback && name.toLowerCase().endsWith(".sdat")) {
+          fallback = { fileId, path };
+        }
+        fileId++;
+      }
+    }
+    return null;
+  }
+
+  const result = walk(0xf000, "");
+  const entry = result?.preferred || fallback;
+  if (!entry) throw new Error("No SDAT sound archive was found in this ROM.");
+
+  const fatEntry = fatOffset + entry.fileId * 8;
+  if (fatEntry + 8 > fatOffset + fatLength) throw new Error("The SDAT file points outside the ROM FAT.");
+  const start = romView.getUint32(fatEntry, true);
+  const end = romView.getUint32(fatEntry + 4, true);
+  if (start >= end || end > rom.byteLength) throw new Error("The SDAT file range is invalid.");
+
+  return { ...entry, buffer: rom.slice(start, end), start, end };
+}
+
+function cleanReferenceLabel(text) {
+  return (text || "")
+    .replace(/\s*\(TODO:.*?\)\s*$/i, "")
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
+function genericLabel(name) {
+  return name
+    .replace(/^SEQ_(BGM|ME)_/, "")
+    .split("_")
+    .map((part) => part.length <= 3 ? part : part[0] + part.slice(1).toLowerCase())
+    .join(" ");
+}
+
+function useLabel(name, reference) {
+  const ref = cleanReferenceLabel(reference) || genericLabel(name);
+  if (name.startsWith("SEQ_ME_")) return `Fanfare / jingle — ${ref}`;
+  if (/^SEQ_BGM_(STARTING|STARTING2|TITLE|TITLE01|POKEMON_THEME)$/.test(name)) return `Opening / title sequence — ${ref}`;
+  if (name === "SEQ_BGM_ENDING") return "Ending sequence";
+  if (name.startsWith("SEQ_BGM_EYE_")) return ref.startsWith("Trainers' Eyes Meet") ? ref : `Trainer encounter — ${ref}`;
+  if (name.startsWith("SEQ_BGM_VS_")) return ref.startsWith("Battle!") ? ref : `Battle — ${ref}`;
+  if (name.startsWith("SEQ_BGM_WIN")) return ref.startsWith("Victory!") ? ref : `Battle victory — ${ref}`;
+  if (name.startsWith("SEQ_BGM_E_")) return /theme|appears|ambitions|farewell|heart|formula|together|trouble/i.test(ref) ? `Story / character scene — ${ref}` : `Story / event — ${ref}`;
+  if (name.startsWith("SEQ_BGM_MSL_")) return `Pokémon Musical — ${ref}`;
+  return ref;
+}
+
+function stripVariantText(text) {
+  return text
+    .replace(/\s*\((?:Spring|Summer|Autumn|Winter)(?:\/(?:Spring|Summer|Autumn|Winter))*\)\s*/gi, "")
+    .replace(/\s*\(Pokémon (?:Black|White)\)\s*/gi, "")
+    .replace(/\s*\((?:B1F|B2F|B3F|1F|2F|3F)\)\s*/gi, "")
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
+function buildDescriptors(sequences) {
+  const named = sequences.filter((s) => s.name && (s.name.startsWith("SEQ_BGM_") || s.name.startsWith("SEQ_ME_")));
+  const names = new Set(named.map((s) => s.name));
+  const byName = new Map(named.map((s) => [s.name, s]));
+
+  const result = named.map((seq) => {
+    const name = seq.name;
