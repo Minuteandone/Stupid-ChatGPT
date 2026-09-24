@@ -473,10 +473,39 @@ function infoText(s, sampleRate, loops, renderedTracks, loopDetected) {
     `Sample rate: ${sampleRate} Hz`,
     `Requested loops: ${loops}`,
     `Loop boundary detected: ${loopDetected ? "yes" : "no (sequence ended naturally or safety cap was used)"}`,
-    `Rendered stem tracks: ${renderedTracks.length ? renderedTracks.map((n) => n + 1).join(", ") : "none"}`,
+    `Rendered stems: ${renderedTracks.length ? renderedTracks.map((stem) => `Track ${stem.track + 1}: ${stem.name}`).join(" | ") : "none"}`,
     "",
     "Folder names describe in-game use. Internal names are kept only in this info file."
   ].join("\n");
+}
+
+function describeInstrumentProgram(bank, program) {
+  const instrument = bank?.instruments?.[program];
+  if (!instrument) return `Unknown instrument P${program}`;
+
+  switch (instrument.type) {
+    case Audio.InstrumentType.DrumSet:
+      return `Drum kit P${program}`;
+    case Audio.InstrumentType.PSG:
+      return `PSG synth P${program}`;
+    case Audio.InstrumentType.WhiteNoise:
+      return `Noise percussion P${program}`;
+    case Audio.InstrumentType.KeySplit:
+      return `Key-split sampled instrument P${program}`;
+    case Audio.InstrumentType.PCM:
+    case Audio.InstrumentType.DirectPCM:
+      return `Sampled instrument P${program}`;
+    default:
+      return `Instrument P${program}`;
+  }
+}
+
+function describeStemPrograms(bank, programCounts) {
+  const used = [...programCounts.entries()]
+    .sort((a, b) => b[1] - a[1] || a[0] - b[0])
+    .map(([program]) => describeInstrumentProgram(bank, program));
+
+  return used.length ? used.join(" + ") : "Unknown instrument";
 }
 
 async function renderStem(seq, trackNo, sampleRate, requestedLoops) {
@@ -496,6 +525,19 @@ async function renderStem(seq, trackNo, sampleRate, requestedLoops) {
       appendChunk(rightChunks, buf[1]);
     }
   });
+
+  // Record only programs that actually produce notes on this stem.
+  // Program numbers are bank-local; the SDAT does not contain friendly names
+  // such as "piano", so labels stick to the instrument type the bank exposes.
+  const programCounts = new Map();
+  const originalPlayNote = renderer.synth.playNote.bind(renderer.synth);
+  renderer.synth.playNote = (track, note, velocity, duration, trackInfo) => {
+    if (track === trackNo) {
+      const program = renderer.synth.channels[track]?.programNumber ?? 0;
+      programCounts.set(program, (programCounts.get(program) || 0) + 1);
+    }
+    return originalPlayNote(track, note, velocity, duration, trackInfo);
+  };
 
   let loopsSeen = 0;
   let loopDetected = false;
@@ -538,7 +580,13 @@ async function renderStem(seq, trackNo, sampleRate, requestedLoops) {
 
   const left = mergeFloatChunks(leftChunks);
   const right = mergeFloatChunks(rightChunks);
-  return { left, right, loopDetected };
+  return {
+    left,
+    right,
+    loopDetected,
+    programs: [...programCounts.keys()],
+    instrumentName: describeStemPrograms(file.bank, programCounts)
+  };
 }
 
 
@@ -602,10 +650,10 @@ function renderMixerStems() {
     const label = document.createElement("div");
     const name = document.createElement("div");
     name.className = "stem-name";
-    name.textContent = `Track ${String(stem.track + 1).padStart(2, "0")}`;
+    name.textContent = stem.name;
     const meta = document.createElement("div");
     meta.className = "stem-meta";
-    meta.textContent = `${formatTime(stem.buffer.duration)} · sequence track ${stem.track + 1}`;
+    meta.textContent = `Track ${String(stem.track + 1).padStart(2, "0")} · ${formatTime(stem.buffer.duration)}`;
     label.append(name, meta);
 
     const muteLabel = document.createElement("label");
@@ -749,6 +797,7 @@ async function openMixer(song) {
 
         stems.push({
           track,
+          name: rendered.instrumentName || "Unknown instrument",
           buffer,
           gain,
           muted: false,
@@ -810,11 +859,12 @@ async function exportSongs(songs) {
 
         if (audioPeak(rendered.left, rendered.right) > 0.00002) {
           const wav = interleaveToWav(rendered.left, rendered.right, sampleRate);
+          const instrumentName = rendered.instrumentName || "Unknown instrument";
           zipEntries.push(makeZipEntry(
-            `${folderPath}/Track ${String(track + 1).padStart(2, "0")}.wav`,
+            `${folderPath}/${safeName(instrumentName)} - Track ${String(track + 1).padStart(2, "0")}.wav`,
             wav
           ));
-          renderedTracks.push(track);
+          renderedTracks.push({ track, name: instrumentName });
         }
 
         completedUnits++;
