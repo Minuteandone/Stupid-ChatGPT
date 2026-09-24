@@ -5,28 +5,31 @@ The name isn’t related to the project by the way I just think ChatGPT is being
 
 # Pokémon Black / White browser stem extractor
 
-A static, client-side GitHub Pages tool for extracting music stems from a user-supplied Pokémon Black or Pokémon White Nintendo DS ROM.
+A static GitHub Pages tool that processes a user-selected Pokémon Black or White Nintendo DS ROM entirely in the browser.
 
 ## What it does
 
-- Reads the ROM entirely in the browser; the ROM is never uploaded.
-- Finds the root `wb_sound_data.sdat` sound archive.
-- Lists BGM sequences (and optionally short `SEQ_ME_*` jingles).
-- Groups known seasonal and Black/White variants under usage-based names.
-- Uses `nitro-fs`'s SSEQ renderer and `activeTracks` mask to render individual sequence tracks as separate WAV stems.
-- Omits silent sequence tracks.
-- Generates one ZIP for all selected songs, with `info.txt` files containing the original internal sequence name/ID.
-- Lets you choose a loop count: intro once, followed by exactly that many complete loop passes. Non-looping tracks render once.
+- Reads the ROM locally; the ROM is never uploaded.
+- Locates `wb_sound_data.sdat` directly from the NDS filesystem without cloning the whole ROM filesystem into memory.
+- Catalogs Black/White BGM by what the sequence is used for.
+- Groups seasonal, Black/White, and floor/location variations.
+- Renders individual SSEQ tracks as separate stereo 16-bit WAV stems.
+- Omits silent tracks.
+- Lets you choose a loop count: intro once, then exactly N complete loop passes.
+- Renders non-looping sequences to their natural end.
+- Exports usage-named folders with `info.txt` files containing internal sequence IDs/names.
+- Uses small ZIP batches to reduce memory pressure on iPad/Safari.
+- Can optionally include short fanfares/jingles.
 
 ## GitHub Pages
 
-The repository includes `.github/workflows/pages.yml`, using the official GitHub Pages actions. If Pages has never been enabled for the repository, open **Settings → Pages → Build and deployment → Source** and choose **GitHub Actions** once.
+The Pages workflow deploys from `main` using GitHub Actions. The current site code is split into four text chunks under `app.parts/`; the small `app.js` loader reassembles them in the browser before running the extractor.
 
 ## Dependencies
 
-Loaded as ES modules at runtime:
+Loaded in the browser as ES modules:
 
 - [`nitro-fs`](https://github.com/DanielPXL/nitro-fs) (LGPL-3.0-or-later)
 - [`JSZip`](https://stuk.github.io/jszip/) (MIT)
 
-No ROMs or game audio are included in this repository.
+No ROM or game-audio data is stored in this repository.
