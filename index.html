@@ -14,42 +14,84 @@
       <h1>Pokémon Black / White<br>music stem extractor</h1>
       <p class="lead">Choose your own Black or White ROM. Nothing is uploaded. The page reads <code>wb_sound_data.sdat</code>, groups version/season variants, renders individual SSEQ tracks as WAV stems, and gives you ZIPs.</p>
     </header>
+
     <section class="card upload-card">
-      <label class="file-picker"><span>Choose Black / White ROM</span><input id="romInput" type="file" accept=".nds,application/octet-stream" /></label>
+      <label class="file-picker">
+        <span>Choose Black / White ROM</span>
+        <input id="romInput" type="file" accept=".nds,application/octet-stream" />
+      </label>
       <p id="romStatus" class="status">No ROM loaded yet.</p>
     </section>
+
     <section id="controls" class="card hidden">
       <div class="control-grid">
-        <label><span>Stem length</span><select id="duration"><option value="30">30 seconds</option><option value="60" selected>60 seconds</option><option value="90">90 seconds</option><option value="120">120 seconds</option><option value="180">180 seconds</option></select></label>
-        <label><span>Sample rate</span><select id="sampleRate"><option value="22050">22,050 Hz (smaller / faster)</option><option value="32768" selected>32,768 Hz (DS-ish)</option><option value="44100">44,100 Hz</option></select></label>
-        <label><span>Batch size</span><select id="batchSize"><option value="1">1 song</option><option value="2" selected>2 songs</option><option value="3">3 songs</option><option value="4">4 songs</option></select></label>
+        <label>
+          <span>Loops to render</span>
+          <select id="loopCount">
+            <option value="1">1 loop</option>
+            <option value="2" selected>2 loops</option>
+            <option value="3">3 loops</option>
+            <option value="4">4 loops</option>
+            <option value="5">5 loops</option>
+            <option value="8">8 loops</option>
+          </select>
+        </label>
+        <label>
+          <span>Sample rate</span>
+          <select id="sampleRate">
+            <option value="22050">22,050 Hz (smaller / faster)</option>
+            <option value="32768" selected>32,768 Hz (DS-ish)</option>
+            <option value="44100">44,100 Hz</option>
+          </select>
+        </label>
+        <label>
+          <span>Batch size</span>
+          <select id="batchSize">
+            <option value="1">1 song</option>
+            <option value="2" selected>2 songs</option>
+            <option value="3">3 songs</option>
+            <option value="4">4 songs</option>
+          </select>
+        </label>
       </div>
+
       <div class="toolbar">
         <input id="search" type="search" placeholder="Search by use, e.g. Route 1, N, battle…" />
         <label class="toggle"><input id="includeJingles" type="checkbox" /> include short fanfares/jingles</label>
       </div>
+
       <div class="actions">
         <button id="selectVisible" class="secondary">Select visible</button>
         <button id="clearSelection" class="secondary">Clear</button>
         <button id="exportSelected">Export selected</button>
         <button id="exportNext" class="secondary">Export next batch</button>
       </div>
+
       <div class="progress-wrap hidden" id="progressWrap">
         <div class="progress-label"><span id="progressText">Working…</span><span id="progressPct">0%</span></div>
         <progress id="progress" max="1" value="0"></progress>
       </div>
     </section>
+
     <section id="catalogSection" class="card hidden">
-      <div class="catalog-head"><div><div class="eyebrow">catalog</div><h2 id="catalogTitle">Music</h2></div><div id="countBadge" class="badge"></div></div>
+      <div class="catalog-head">
+        <div>
+          <div class="eyebrow">catalog</div>
+          <h2 id="catalogTitle">Music</h2>
+        </div>
+        <div id="countBadge" class="badge"></div>
+      </div>
       <div id="catalog" class="catalog"></div>
     </section>
+
     <section class="card smallprint">
       <h2>What counts as a stem?</h2>
       <p>Each DS SSEQ can use up to 16 sequencer tracks. This page renders each active SSEQ track separately using the game’s own instrument banks and wave archives. Silent tracks are discarded automatically.</p>
-      <p>Most background music loops forever, so the renderer uses the length you choose above rather than waiting for a song to “finish.” Longer lengths make much larger ZIPs—especially on iPad.</p>
+      <p>For looping music, the page keeps the one-time intro and then renders exactly the number of complete loops you choose. Non-looping sequences render once. A hidden safety cap prevents malformed sequences from running forever.</p>
       <p class="muted">The ROM is processed locally with <a href="https://github.com/DanielPXL/nitro-fs">nitro-fs</a>. This site does not include ROMs or game audio.</p>
     </section>
   </main>
+
   <script type="module" src="app.js"></script>
 </body>
 </html>
