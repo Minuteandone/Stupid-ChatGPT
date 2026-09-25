@@ -10,6 +10,13 @@ const state = {
   selected: new Set(),
   fileName: "",
   busy: false,
+  sampleLabelAliases: {
+    raw: new Map(),
+    pcm: new Map(),
+    knownSamples: 0,
+    unambiguousRaw: 0,
+    unambiguousPcm: 0
+  },
   mixer: {
     ctx: null,
     song: null,
@@ -547,6 +554,146 @@ function stemFileName(stem) {
   return `${safeName(stem.name)} - Track ${String(tracks[0] + 1).padStart(2, "0")}.wav`;
 }
 
+function dualHashBytes(bytes) {
+  let h1 = 0x811c9dc5;
+  let h2 = 0x9e3779b9;
+
+  for (let i = 0; i < bytes.length; i++) {
+    const value = bytes[i];
+    h1 ^= value;
+    h1 = Math.imul(h1, 0x01000193) >>> 0;
+
+    h2 ^= value + ((i & 0xff) << 8);
+    h2 = Math.imul(h2, 0x85ebca6b) >>> 0;
+    h2 ^= h2 >>> 13;
+  }
+
+  return `${bytes.length}:${h1.toString(16)}:${h2.toString(16)}`;
+}
+
+function rawSwavFingerprint(swav) {
+  const data = swav?.dataBlock?.audioData;
+  if (!data) return null;
+
+  const bytes = new Uint8Array(data.getBuffer());
+  const block = swav.dataBlock;
+  return [
+    block.encoding,
+    block.sampleRate,
+    block.loop ? 1 : 0,
+    block.loopStart ?? 0,
+    block.loopLength ?? 0,
+    dualHashBytes(bytes)
+  ].join(":");
+}
+
+function pcmSwavFingerprint(swav) {
+  if (!swav?.toPCM) return null;
+  const pcm = swav.toPCM();
+  if (!pcm?.length) return null;
+
+  let h1 = 0x811c9dc5;
+  let h2 = 0x9e3779b9;
+
+  for (let i = 0; i < pcm.length; i++) {
+    const sample = Math.max(-1, Math.min(1, pcm[i]));
+    const q = Math.round(sample * 32767);
+    const lo = q & 0xff;
+    const hi = (q >>> 8) & 0xff;
+
+    h1 ^= lo;
+    h1 = Math.imul(h1, 0x01000193) >>> 0;
+    h1 ^= hi;
+    h1 = Math.imul(h1, 0x01000193) >>> 0;
+
+    h2 ^= (lo | (hi << 8)) + (i & 0xffff);
+    h2 = Math.imul(h2, 0x85ebca6b) >>> 0;
+    h2 ^= h2 >>> 13;
+  }
+
+  return [
+    pcm.length,
+    swav.dataBlock?.sampleRate ?? 0,
+    swav.dataBlock?.loop ? 1 : 0,
+    swav.dataBlock?.loopStart ?? 0,
+    swav.dataBlock?.loopLength ?? 0,
+    h1.toString(16),
+    h2.toString(16)
+  ].join(":");
+}
+
+function addFingerprintLabel(index, fingerprint, label) {
+  if (!fingerprint || !label) return;
+  let labels = index.get(fingerprint);
+  if (!labels) {
+    labels = new Set();
+    index.set(fingerprint, labels);
+  }
+  labels.add(label);
+}
+
+function countUnambiguousFingerprints(index) {
+  let count = 0;
+  for (const labels of index.values()) {
+    if (labels.size === 1) count++;
+  }
+  return count;
+}
+
+async function buildSampleLabelAliasIndex(sdat, onProgress) {
+  const raw = new Map();
+  const pcm = new Map();
+  let knownSamples = 0;
+
+  const labeledArchives = sdat.fs.waveArchives.filter((archive) => BW_SWAV_LABELS[archive.name]);
+  for (let archiveIndex = 0; archiveIndex < labeledArchives.length; archiveIndex++) {
+    const archive = labeledArchives[archiveIndex];
+    onProgress?.(archiveIndex, labeledArchives.length, archive.name);
+
+    const swar = new Audio.SWAR(archive.buffer);
+    const labels = BW_SWAV_LABELS[archive.name] || {};
+
+    for (const [waveIdText, label] of Object.entries(labels)) {
+      const waveId = Number(waveIdText);
+      const swav = swar.waves[waveId];
+      if (!swav || !label) continue;
+
+      knownSamples++;
+      addFingerprintLabel(raw, rawSwavFingerprint(swav), label);
+      addFingerprintLabel(pcm, pcmSwavFingerprint(swav), label);
+    }
+
+    if ((archiveIndex & 3) === 3) {
+      await new Promise((resolve) => setTimeout(resolve, 0));
+    }
+  }
+
+  state.sampleLabelAliases = {
+    raw,
+    pcm,
+    knownSamples,
+    unambiguousRaw: countUnambiguousFingerprints(raw),
+    unambiguousPcm: countUnambiguousFingerprints(pcm)
+  };
+}
+
+function uniqueLabelForFingerprint(index, fingerprint) {
+  if (!fingerprint) return null;
+  const labels = index?.get(fingerprint);
+  if (!labels || labels.size !== 1) return null;
+  return labels.values().next().value || null;
+}
+
+function inferredLabelForSwav(swav) {
+  const aliases = state.sampleLabelAliases;
+  if (!aliases) return null;
+
+  const rawMatch = uniqueLabelForFingerprint(aliases.raw, rawSwavFingerprint(swav));
+  if (rawMatch) return rawMatch;
+
+  return uniqueLabelForFingerprint(aliases.pcm, pcmSwavFingerprint(swav));
+}
+
 function getWaveArchiveNamesForSequence(seq) {
   const bankFile = state.sdat?.fs?.banks?.find((bank) => bank.id === seq.fileInfo?.bankId);
   if (!bankFile) return [];
@@ -584,11 +731,11 @@ function resolveNoteInstrumentLabel(bank, channel, note, waveArchiveNames) {
   const resolved = channel?.getNoteInfo?.(note);
 
   if (!resolved?.noteInfo) {
-    return { label: fallback, sample: "", mapped: false, playable: false };
+    return { label: fallback, sample: "", mapped: false, inferred: false, playable: false };
   }
 
   if (resolved.isPSG || resolved.isWhiteNoise) {
-    return { label: fallback, sample: "", mapped: false, playable: true };
+    return { label: fallback, sample: "", mapped: false, inferred: false, playable: true };
   }
 
   const archiveSlot = resolved.noteInfo.waveArchiveId;
@@ -596,10 +743,15 @@ function resolveNoteInstrumentLabel(bank, channel, note, waveArchiveNames) {
   const archiveName = waveArchiveNames[archiveSlot];
   const mappedLabel = archiveName ? BW_SWAV_LABELS[archiveName]?.[waveId] : null;
 
+  const swav = channel?.swars?.[archiveSlot]?.waves?.[waveId];
+  const inferredLabel = mappedLabel ? null : inferredLabelForSwav(swav);
+  const label = mappedLabel || inferredLabel || fallback;
+
   return {
-    label: mappedLabel || fallback,
+    label,
     sample: archiveName ? `${archiveName} SWAV ${waveId}` : `SWAV ${waveId}`,
     mapped: !!mappedLabel,
+    inferred: !!inferredLabel,
     playable: true
   };
 }
@@ -685,10 +837,12 @@ async function renderStem(seq, trackNo, sampleRate, requestedLoops, instrumentFi
       const usage = labelUsage.get(resolvedLabel.label) || {
         count: 0,
         samples: new Set(),
-        mapped: false
+        mapped: false,
+        inferred: false
       };
       usage.count++;
       usage.mapped ||= resolvedLabel.mapped;
+      usage.inferred ||= resolvedLabel.inferred;
       if (resolvedLabel.sample) usage.samples.add(resolvedLabel.sample);
       labelUsage.set(resolvedLabel.label, usage);
     }
@@ -1123,6 +1277,13 @@ $("romInput").addEventListener("change", async (event) => {
   state.sdat = null;
   state.sequences = [];
   state.selected.clear();
+  state.sampleLabelAliases = {
+    raw: new Map(),
+    pcm: new Map(),
+    knownSamples: 0,
+    unambiguousRaw: 0,
+    unambiguousPcm: 0
+  };
   $("controls").classList.add("hidden");
   $("catalogSection").classList.add("hidden");
   $("progressWrap").classList.add("hidden");
@@ -1140,11 +1301,16 @@ $("romInput").addEventListener("change", async (event) => {
     state.sequences = sequences;
     state.fileName = file.name;
 
+    setStatus("Learning duplicate sample labels from known BW instruments…");
+    await buildSampleLabelAliasIndex(sdat, (current, total, archiveName) => {
+      setStatus(`Learning duplicate sample labels… ${current + 1}/${total} · ${archiveName}`);
+    });
+
     $("controls").classList.remove("hidden");
     $("catalogSection").classList.remove("hidden");
     $("catalogTitle").textContent = "Black / White music";
     setStatus(
-      `Loaded ${file.name}. Found ${found.path} and ${sequences.filter((s) => !s.isJingle).length} BGM sequences.`,
+      `Loaded ${file.name}. Found ${found.path}, ${sequences.filter((s) => !s.isJingle).length} BGM sequences, and learned ${state.sampleLabelAliases.unambiguousRaw} exact + ${state.sampleLabelAliases.unambiguousPcm} decoded sample fingerprints for label reuse.`,
       "ok"
     );
     renderCatalog();
